@@ -88,7 +88,17 @@ for (const [el, key, coerce] of [
 });
 
 // ----- Config -----
-const BACKEND_URL = 'http://localhost:8080';
+const BACKEND_URL = 'https://live-transcriber-0md8.onrender.com';
+
+function wsUrl() {
+  const u = new URL(BACKEND_URL);
+  // upgrade http(s) -> ws(s)
+  u.protocol = (u.protocol === 'https:') ? 'wss:' : 'ws:';
+  u.pathname = '/realtime';
+  u.search = '?enc=webm';
+  return u.toString();
+}
+
 const UPLOAD_TIMEOUT_MS = 3000; // detect Wi-Fi off quickly
 
 // dedup tuning
@@ -485,10 +495,27 @@ function startFlushLoop() {
   }, 5000);
 }
 
+// ---- Flush-first mode: drain queued chunks completely, then resume normal posting
+let flushMode = false;
+async function drainQueueFully() {
+  if (!navigator.onLine) return;
+  flushMode = true;
+  try {
+    while (await queueCount() > 0 && navigator.onLine) {
+      const had = await flushQueueOnce();
+      if (!had) break;
+    }
+  } finally {
+    flushMode = false;
+    await refreshQueueCount();
+  }
+}
+
 window.addEventListener('online', () => {
   renderConn();
   if (offlineQueueCount > 0) toast('Back online — flushing queued chunks', 'ok');
-  startFlushLoop();
+  // Drain first so offline text appears before new online segments
+  drainQueueFully().then(() => startFlushLoop()).catch(() => startFlushLoop());
 });
 window.addEventListener('offline', () => {
   renderConn();
@@ -523,7 +550,7 @@ function clearWsProbe() {
 function wsConnect() {
   return new Promise((resolve, reject) => {
     try {
-      ws = new WebSocket(`ws://localhost:8080/realtime?enc=webm`);
+      ws = new WebSocket(wsUrl());
       ws.binaryType = 'arraybuffer';
       const to = setTimeout(() => {
         try {
@@ -633,6 +660,12 @@ function startWsProbe() {
       return;
     }
     if (wsMode || !stream) return;
+
+    // If we still have backlog, delay switching to WS so offline text renders first.
+    try {
+      if (await queueCount() > 0) return;
+    } catch {}
+
     try {
       await wsConnect();
       wsMode = true;
@@ -760,9 +793,11 @@ function startRecorder() {
       : null;
     R.chunks = [];
     if (blob) {
-      if (!navigator.onLine) {
-        dbg(`📥 offline → queued seg #${R.idx}`);
+      // flush-first: while offline or while we still have backlog or during draining, enqueue
+      if (!navigator.onLine || flushMode || offlineQueueCount > 0) {
+        dbg('📥 enqueue (offline or flushing/backlog present)');
         await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
+        if (navigator.onLine) startFlushLoop();
       } else {
         const fd = new FormData();
         fd.append('audio', blob, `seg-${R.idx}-${Date.now()}.webm`);
@@ -777,12 +812,10 @@ function startRecorder() {
           } else {
             dbg('…all overlap (deduped)');
           }
-          if (offlineQueueCount > 0 && navigator.onLine) {
-            await flushQueueOnce().catch(() => {});
-          }
         } catch {
           dbg('❌ upload failed; queued');
           await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
+          startFlushLoop();
         }
       }
     }
