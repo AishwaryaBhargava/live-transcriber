@@ -1,0 +1,30 @@
+{
+  "name": "Live Transcriber",
+  "description": "Real-time tab/mic transcription with offline queue & exports.",
+  "version": "0.0.1",
+  "manifest_version": 3,
+
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "storage",
+    "sidePanel",
+    "tabs",
+    "scripting",
+    "microphone"
+  ],
+
+  "host_permissions": ["<all_urls>"],
+  "optional_host_permissions": ["<all_urls>"],
+
+  "background": { "service_worker": "background/sw.js" },
+  "side_panel": { "default_path": "sidepanel/index.html" },
+  "action": { "default_title": "Live Transcriber" },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["sidepanel/pcm-worklet.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

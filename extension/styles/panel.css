@@ -1,0 +1,305 @@
+/* ===========================
+   TwinMind Sidepanel UI (refined header spacing + compact brand)
+   =========================== */
+
+:root {
+  --pad: 12px;
+  --gap: 12px; /* slightly larger default gap */
+  --radius: 10px;
+  --font: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+
+  /* Light */
+  --bg: #ffffff;
+  --fg: #0f172a;
+  --muted: #64748b;
+  --surface: #f7fafc;
+  --surface-2: #eff2f6;
+  --border-color: #e5e7eb;
+  --chip-bg: #eef2ff;
+  --chip-fg: #1e3a8a;
+  --primary: #4f46e5;
+  --primary-fg: #ffffff;
+
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --bg: #0b0e14;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --surface: #121722;
+  --surface-2: #0f141f;
+  --border-color: #232a38;
+  --chip-bg: #1c2442;
+  --chip-fg: #c7d2fe;
+  --primary: #6366f1;
+  --primary-fg: #ffffff;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+}
+body {
+  padding: var(--pad);
+  margin: 0;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  margin: 12px 0;
+}
+
+/* Header */
+.tm-header {
+  display: grid;
+  gap: 8px;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.2px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border-color);
+  width: fit-content;
+}
+
+.header-row {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr auto auto auto; /* badges, spacer, icons */
+  align-items: center;
+  gap: 10px 12px; /* a little extra breathing room */
+  padding: 6px 2px 8px;
+}
+
+/* Spacer pushes icons to the far right */
+.spacer {
+  width: 100%;
+}
+
+/* Badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  font-size: 12px;
+}
+
+/* Controls + status rows */
+.tm-controls,
+.tm-status {
+  display: flex;
+  gap: var(--gap);
+  align-items: center;
+  margin-bottom: var(--gap);
+  flex-wrap: wrap;
+}
+
+/* Buttons */
+button {
+  appearance: none;
+  border: 1px solid var(--border-color);
+  background: var(--surface);
+  color: var(--fg);
+  border-radius: 12px;
+  padding: 9px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+button.primary {
+  background: var(--primary);
+  color: var(--primary-fg);
+  border-color: transparent;
+}
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+/* Icon buttons */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 15px;
+  cursor: pointer;
+  line-height: 1;
+}
+.icon-btn:hover {
+  background: var(--surface-2);
+}
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Transcript */
+.tm-transcript {
+  margin-top: var(--gap);
+}
+.tm-transcript-box {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: var(--pad);
+  height: 260px;
+  overflow: auto;
+  background: var(--surface);
+  line-height: 1.45;
+}
+.line {
+  margin: 6px 0;
+}
+
+/* Timestamp chip */
+.ts {
+  border: 1px solid var(--border-color);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  border-radius: 8px;
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+/* Debug/partials */
+.partial {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Toast */
+#toast {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border-color);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(6px);
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+  max-width: 280px;
+  font-size: 13px;
+}
+#toast.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+#toast.show.ok {
+  border-color: #10b981;
+}
+#toast.show.warn {
+  border-color: #f59e0b;
+}
+#toast.show.err {
+  border-color: #ef4444;
+}
+
+/* ===========================
+   Modals (Settings / Export)
+   =========================== */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: none;
+  z-index: 9999;
+}
+.modal[aria-hidden='false'] {
+  display: grid;
+  place-items: center;
+}
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(2px);
+}
+.modal-card {
+  position: relative;
+  width: min(720px, 94vw);
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.2);
+}
+.modal-head,
+.modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+.modal-actions {
+  border-top: 1px solid var(--border-color);
+  border-bottom: 0;
+}
+.modal-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.modal-body {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+select,
+input[type='number'] {
+  background: var(--surface-2);
+  color: var(--fg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 13px;
+}

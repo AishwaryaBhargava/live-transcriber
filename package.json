@@ -1,0 +1,31 @@
+{
+  "name": "twinmind-tab-transcriber",
+  "version": "1.0.0",
+  "description": "Chrome side-panel transcriber (Deepgram realtime + chunked fallback)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "start:server": "node backend/server.js",
+    "lint": "eslint extension backend",
+    "format": "prettier --write \"**/*.{js,json,css,html,md}\"",
+    "check": "npm run lint && prettier --check \"**/*.{js,json,css,html,md}\"",
+    "zip": "cd dist && powershell Compress-Archive -Path * -DestinationPath ../Live-Transcriber.zip",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@types/chrome": "^0.1.4",
+    "@types/node": "^24.3.0",
+    "eslint": "^9.33.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "webextension-polyfill": "^0.12.0"
+  }
+}

@@ -1,0 +1,35 @@
+# --- Environment (do not commit secrets)
+.env
+backend/.env
+.env.*.local
+*.env.local
+
+# --- Node dependencies
+node_modules/
+**/node_modules/
+
+# --- Build outputs
+dist/
+build/
+extension/build/
+
+# --- Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# --- Chrome extension artifacts
+*.crx
+*.pem
+
+# --- Archives (remove these if you want to commit zips)
+*.zip
+TwinMind-Chrome-Extension.zip

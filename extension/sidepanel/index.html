@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Live Transcriber</title>
+
+    <link rel="stylesheet" href="../styles/panel.css?v=7" />
+    <!-- apply theme asap -->
+    <script type="module" src="theme.js"></script>
+  </head>
+  <body>
+    <div class="tm-header">
+      <div class="brand">Live Transcriber</div>
+
+      <div class="header-row">
+        <span class="badge" id="status">Idle</span>
+        <span class="badge" id="conn">Disconnected</span>
+        <span class="badge" id="timer">00:00</span>
+
+        <span class="spacer"></span>
+        <button id="btn-theme" class="icon-btn" aria-label="Toggle theme">🌙</button>
+        <button id="btn-open-export" class="icon-btn" aria-label="Export">⤓</button>
+        <button id="btn-open-settings" class="icon-btn" aria-label="Settings">⚙️</button>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="tm-controls">
+      <button id="btn-start" class="primary">Start</button>
+      <button id="btn-pause" disabled>Pause</button>
+      <button id="btn-resume" disabled>Resume</button>
+      <button id="btn-stop" disabled>Stop</button>
+    </div>
+
+    <!-- Transcript -->
+    <div class="tm-transcript">
+      <div id="transcript" class="tm-transcript-box"></div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast"></div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal" aria-hidden="true" aria-modal="true" role="dialog">
+      <div class="modal-backdrop" data-close="settings"></div>
+      <div class="modal-card" role="document">
+        <div class="modal-head">
+          <h3>Settings</h3>
+          <button class="icon-btn" aria-label="Close" data-close="settings">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="field-row">
+            <div class="field">
+              <label for="set-provider">Provider</label>
+              <select id="set-provider">
+                <option>Deepgram</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label><input id="set-ws" type="checkbox" /> Prefer WebSocket</label>
+            </div>
+
+            <div class="field">
+              <label for="set-seg">Segment (s)</label>
+              <input id="set-seg" type="number" min="5" max="60" value="10" />
+            </div>
+
+            <div class="field">
+              <label for="set-ovl">Overlap (ms)</label>
+              <input id="set-ovl" type="number" min="0" max="3000" value="1200" />
+            </div>
+
+            <div class="field">
+              <label for="set-ts">Timestamp cadence (s)</label>
+              <input id="set-ts" type="number" min="3" max="20" value="8" />
+            </div>
+
+            <div class="field">
+              <label><input id="chk-debug" type="checkbox" /> Debug</label>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label>Source</label>
+              <label><input id="set-source-tab" name="src" type="radio" /> Tab</label>
+              <label><input id="set-source-pick" name="src" type="radio" /> Pick</label>
+              <label><input id="set-source-mic" name="src" type="radio" /> Mic</label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button class="primary" data-close="settings">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export Modal -->
+    <div id="export-modal" class="modal" aria-hidden="true" aria-modal="true" role="dialog">
+      <div class="modal-backdrop" data-close="export"></div>
+      <div class="modal-card" role="document">
+        <div class="modal-head">
+          <h3>Export transcript</h3>
+          <button class="icon-btn" aria-label="Close" data-close="export">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="field-row">
+            <button id="btn-copy" class="primary" disabled>Copy</button>
+            <button id="btn-download" disabled>Download (.txt)</button>
+            <button id="btn-export-srt" disabled>Export (.srt)</button>
+            <button id="btn-export-json" disabled>Export (.json)</button>
+            <button id="btn-clear" disabled>Clear</button>
+          </div>
+          <div class="partial">Tip: SRT has per-line timing based on your in-panel timestamps.</div>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button class="primary" data-close="export">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- UI wiring for modals + theme (tiny) -->
+    <script type="module" src="ui.js"></script>
+    <!-- Main app -->
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
