@@ -99,7 +99,7 @@ function wsUrl() {
   return u.toString();
 }
 
-const UPLOAD_TIMEOUT_MS = 3000; // detect Wi-Fi off quickly
+const UPLOAD_TIMEOUT_MS = BACKEND_URL.includes('onrender.com') ? 15000 : 3000; // detect Wi-Fi off quickly
 
 // dedup tuning
 const DEDUP_MAX_TAIL_WORDS = 30;
@@ -483,16 +483,13 @@ async function flushQueueOnce() {
 let flushTimer = null;
 function startFlushLoop() {
   if (flushTimer) return;
+  // kick an immediate flush (don't wait for the first interval tick)
+  (async () => {
+    try { await flushQueueOnce(); } catch {}
+  })();
   flushTimer = setInterval(async () => {
-    try {
-      if (!navigator.onLine) return;
-      const had = await flushQueueOnce();
-      if (!had) {
-        clearInterval(flushTimer);
-        flushTimer = null;
-      }
-    } catch {}
-  }, 5000);
+    try { await flushQueueOnce(); } catch {}
+  }, 2000); // a bit faster while recovering
 }
 
 // ---- Flush-first mode: drain queued chunks completely, then resume normal posting
