@@ -80,7 +80,7 @@ function wsUrl(){
 }
 
 // Render can be slow to spin up — longer timeout there.
-const UPLOAD_TIMEOUT_MS = BACKEND_URL.includes('onrender.com') ? 15000 : 3000;
+const UPLOAD_TIMEOUT_MS = 4000;
 
 // dedupe tuning
 const DEDUP_MAX_TAIL_WORDS = 30;
@@ -277,7 +277,7 @@ async function enqueueChunk(blob, seq, t){
   }catch{ toast('Failed to queue chunk','err'); }
 }
 
-async function postWithRetry(fd, tries=2, delay=300){
+async function postWithRetry(fd, tries=1, delay=0){
   for(let i=0;i<tries;i++){
     try{
       const resp = await fetchWithTimeout(`${BACKEND_URL}/transcribe`, {method:'POST', body:fd}, UPLOAD_TIMEOUT_MS);
