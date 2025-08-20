@@ -25,9 +25,7 @@ const settings = Object.assign({}, defaultSettings, loadSettings());
 function loadSettings() {
   try { return JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}'); } catch { return {}; }
 }
-function saveSettings() {
-  localStorage.setItem(LS_SETTINGS, JSON.stringify(settings));
-}
+function saveSettings() { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); }
 
 /* -------------------- Config -------------------- */
 const BACKEND_URL = 'https://live-transcriber-0md8.onrender.com';
@@ -44,12 +42,14 @@ const MAX_BUF      = 200;
 /* -------------------- Queue tuning -------------------- */
 const QUEUE_MAX_ITEMS   = 120;
 const QUEUE_FLUSH_BATCH = 4;
-const BACKLOG_SOFT      = 60;   // prefer queue while backlog is small (to keep chronology)
+const BACKLOG_SOFT      = 60;   // (kept for future tuning)
 const BACKLOG_HARD      = 200;  // aggressive eviction threshold
 let   offlineQueueCount = 0;
 
 // Strong “flush first” switch (stays true while we drain)
 let flushFirst = false;
+// NEW: true as soon as we enqueue anything; goes false ONLY when queue is empty
+let backlogFlag = false;
 
 /* -------------------- DOM refs -------------------- */
 const qs = s => document.querySelector(s);
@@ -180,11 +180,8 @@ function insertTranscriptLine(text, atSeconds){
   const t = typeof atSeconds === 'number' ? atSeconds : elapsed;
 
   let stampThis = false;
-  if (t < lastStamp) {
-    stampThis = true;
-  } else if (!isFinite(lastStamp) || t - lastStamp >= settings.tsCadenceSec) {
-    stampThis = true; lastStamp = t;
-  }
+  if (t < lastStamp) { stampThis = true; }
+  else if (!isFinite(lastStamp) || t - lastStamp >= settings.tsCadenceSec) { stampThis = true; lastStamp = t; }
 
   const div = document.createElement('div');
   div.className = 'line';
@@ -346,6 +343,7 @@ function download(name, text, mime='text/plain'){
 await dbInit().catch(()=>{});
 async function refreshQueueCount(){
   try { offlineQueueCount = await queueCount(); } catch { offlineQueueCount = 0; }
+  backlogFlag = offlineQueueCount > 0; // <— keep the flag in sync
   renderConn();
 }
 
@@ -366,11 +364,13 @@ async function enqueueChunk(blob, seq, t){
       if (olds.length) await queueRemove(olds.map(o=>o.id)).catch(()=>{});
     }
     await addRecord();
+    backlogFlag = true; // <— we definitely have backlog now
   } catch {
     try {
       const olds = await queueTake(20).catch(()=>[]);
       if (olds.length) await queueRemove(olds.map(o=>o.id)).catch(()=>{});
       await addRecord();
+      backlogFlag = true;
     } catch {
       if (navigator.onLine){
         try {
@@ -400,9 +400,8 @@ async function enqueueChunk(blob, seq, t){
 async function flushQueueOnce(){
   if (!navigator.onLine) return false;
 
-  // get a few; make sure oldest go first (by seq if present)
   let items = await queueTake(QUEUE_FLUSH_BATCH).catch(()=>[]);
-  if (!items.length) return false;
+  if (!items.length) { await refreshQueueCount(); return false; }
   items.sort((a,b) => (a.seq ?? 0) - (b.seq ?? 0));
 
   for (const it of items){
@@ -425,7 +424,7 @@ async function flushQueueOnce(){
       break;
     }
   }
-  await refreshQueueCount();
+  await refreshQueueCount();  // also updates backlogFlag
   return true;
 }
 
@@ -441,11 +440,12 @@ function stopFlushLoop(){ if (flushTimer) { clearInterval(flushTimer); flushTime
 async function drainQueueFully(){
   flushFirst = true;
   stopFlushLoop();
-  let guard = 0; // avoids infinite loops
+  let guard = 0;
   while (navigator.onLine && (await queueCount().catch(()=>0)) > 0 && guard++ < 400){
     const had = await flushQueueOnce();
     if (!had) break;
   }
+  await refreshQueueCount();
   startFlushLoop();
   flushFirst = false;
 }
@@ -601,10 +601,9 @@ function startRecorder(){
     const blob = R.chunks.length ? new Blob(R.chunks, { type:R.chunks[0]?.type || 'audio/webm' }) : null;
     R.chunks = [];
     if (blob){
-      // Force-queue while flushFirst OR any backlog exists, or offline.
-      const backlog = offlineQueueCount;
-      const mustQueue = flushFirst || !navigator.onLine || backlog > 0;
-      const preferQueue = mustQueue || (backlog > 0 && backlog < BACKLOG_SOFT);
+      // NEW: force-queue if flushing OR any backlog previously seen OR offline.
+      const mustQueue = flushFirst || backlogFlag || !navigator.onLine || offlineQueueCount > 0;
+      const preferQueue = mustQueue;
 
       if (preferQueue){
         dbg('📥 enqueue (offline or backlog present)');
@@ -625,6 +624,7 @@ function startRecorder(){
           if (offlineQueueCount > 0 && navigator.onLine){ await flushQueueOnce().catch(()=>{}); }
         }catch{
           dbg('❌ inline post failed; queued');
+          backlogFlag = true; // make sure subsequent segments queue
           await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
           startFlushLoop();
         }
@@ -712,6 +712,7 @@ async function clearQueuedBacklog(){
     }
   } catch {}
   offlineQueueCount = 0;
+  backlogFlag = false;
   renderConn();
 }
 
