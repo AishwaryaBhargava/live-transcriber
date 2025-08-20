@@ -1,28 +1,27 @@
 // ===== Live Transcriber sidepanel (Tab / Pick / Mic) =====
-// WS-first (optional) with chunked fallback, overlap, dedup, exports, settings
-// Offline queue to IndexedDB, flush-first on reconnect, ordered rendering
-// Fresh-start on every Start (clears backlog + transcript)
+// WS-first with chunked fallback, offline queue with eviction + direct-post fallback,
+// queued-first drain on reconnect, ordered rendering with timestamp badges,
+// and "Start = clean slate" (transcript + backlog zeroed).
 
 import { dbInit, queueAdd, queueTake, queueRemove, queueCount } from '../lib/db.js';
 
-/* ------------------------- Persisted Settings ------------------------- */
+/* -------------------- Settings / persistence -------------------- */
 const LS_SETTINGS = 'twinmind_settings_v1';
-const LS_TXT = 'twinmind_transcript_v1';
+const LS_TXT      = 'twinmind_transcript_v1';
 
-// Set true only if you want autosave across reloads
+// Fresh start after reload/update; set true to persist transcript across reloads
 const AUTO_RESTORE = false;
 
 const defaultSettings = {
   provider: 'Deepgram',
-  preferWS: false,         // try WS first if true
-  segSec: 10,              // segment duration
-  overlapMs: 1200,         // overlap between segments when overlap is on
-  tsCadenceSec: 8,         // timestamp badge cadence
+  preferWS: false,
+  segSec: 10,
+  overlapMs: 1200,
+  tsCadenceSec: 8,
   debug: false,
-  source: 'tab',           // 'tab' | 'pick' | 'mic'
+  source: 'tab', // 'tab' | 'pick' | 'mic'
 };
 const settings = Object.assign({}, defaultSettings, loadSettings());
-
 function loadSettings() {
   try { return JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}'); } catch { return {}; }
 }
@@ -30,68 +29,47 @@ function saveSettings() {
   localStorage.setItem(LS_SETTINGS, JSON.stringify(settings));
 }
 
-/* ------------------------------ Config ------------------------------- */
+/* -------------------- Config -------------------- */
 const BACKEND_URL = 'https://live-transcriber-0md8.onrender.com';
-
-function wsUrl() {
-  const u = new URL(BACKEND_URL);
-  u.protocol = (u.protocol === 'https:') ? 'wss:' : 'ws:';
-  u.pathname = '/realtime';
-  return u.toString();
-}
-
-// Render can be slow to cold-start: give it more time
 const UPLOAD_TIMEOUT_MS = BACKEND_URL.includes('onrender.com') ? 15000 : 3000;
 
-// Dedup tuning
+/* -------------------- Dedup + ordering tuning -------------------- */
 const DEDUP_MAX_TAIL_WORDS = 30;
 const DEDUP_MIN_MATCH_WORDS = 3;
 
-// Offline queue tuning
-const QUEUE_MAX_ITEMS = 120;
+const REORDER_SECS = 8;    // live lines are held briefly so earlier queued lines can land first
+const MAX_WAIT_MS  = 7000; // or flush by age
+const MAX_BUF      = 200;
+
+/* -------------------- Queue tuning -------------------- */
+// We keep the queue healthy to avoid quota failures
+const QUEUE_MAX_ITEMS = 120;  // target to stay under
 const QUEUE_FLUSH_BATCH = 4;
+const BACKLOG_SOFT = 60;      // if backlog < SOFT, prefer queue (offline-first UX)
+const BACKLOG_HARD = 200;     // if backlog >= HARD, evict oldest aggressively
 let offlineQueueCount = 0;
 
-// backlog caps (to prevent quota explosions)
-const BACKLOG_SOFT = 60;       // if backlog < SOFT → prefer queue (offline-first UX)
-const BACKLOG_HARD = 200;      // absolute cap: start evicting oldest aggressively
+/* -------------------- DOM refs -------------------- */
+const qs = s => document.querySelector(s);
 
-// Chronological render buffer
-const REORDER_SECS = 8;
-const MAX_WAIT_MS = 7000;
-const MAX_BUF = 200;
-
-/* ------------------------------- DOM -------------------------------- */
-const qs = (s) => document.querySelector(s);
-
-const elStatus = qs('#status');
-const elConn   = qs('#conn');
-const elTimer  = qs('#timer');
+const elStatus     = qs('#status');
+const elConn       = qs('#conn');
+const elTimer      = qs('#timer');
 const elTranscript = qs('#transcript');
 
-const btnStart = qs('#btn-start');
-const btnPause = qs('#btn-pause');
-const btnResume = qs('#btn-resume');
-const btnStop  = qs('#btn-stop');
-const btnCopy  = qs('#btn-copy');
-const btnDownload = qs('#btn-download');
-const btnExportSrt = qs('#btn-export-srt');
-const btnExportJson = qs('#btn-export-json');
-const btnClear = qs('#btn-clear');
+const btnStart       = qs('#btn-start');
+const btnPause       = qs('#btn-pause');
+const btnResume      = qs('#btn-resume');
+const btnStop        = qs('#btn-stop');
+const btnCopy        = qs('#btn-copy');
+const btnDownload    = qs('#btn-download');
+const btnExportSrt   = qs('#btn-export-srt');
+const btnExportJson  = qs('#btn-export-json');
+const btnClear       = qs('#btn-clear');
 
-// Settings UI
-const setProvider = qs('#set-provider');
-const setWS       = qs('#set-ws');
-const setSeg      = qs('#set-seg');
-const setOvl      = qs('#set-ovl');
-const setTs       = qs('#set-ts');
-const chkDebug    = qs('#chk-debug');
-const setSourceTab  = qs('#set-source-tab');
-const setSourcePick = qs('#set-source-pick');
-const setSourceMic  = qs('#set-source-mic');
-
-// Toast
 const toastEl = qs('#toast');
+
+/* -------------------- Status / UI helpers -------------------- */
 let toastT = null;
 function toast(msg, kind = 'ok') {
   toastEl.textContent = msg;
@@ -100,44 +78,6 @@ function toast(msg, kind = 'ok') {
   toastT = setTimeout(() => (toastEl.className = ''), 1800);
 }
 
-/* ------------------------- Wire Settings UI -------------------------- */
-setProvider.value = settings.provider;
-setWS.checked     = settings.preferWS;
-setSeg.value      = settings.segSec;
-setOvl.value      = settings.overlapMs;
-setTs.value       = settings.tsCadenceSec;
-chkDebug.checked  = settings.debug;
-
-if (settings.source === 'tab')  setSourceTab.checked = true;
-if (settings.source === 'pick') setSourcePick.checked = true;
-if (settings.source === 'mic')  setSourceMic.checked = true;
-
-for (const [el, key, coerce] of [
-  [setProvider, 'provider', String],
-  [setWS, 'preferWS', (v) => !!v],
-  [setSeg, 'segSec', (v) => Math.max(5, Math.min(60, Number(v) || 10))],
-  [setOvl, 'overlapMs', (v) => Math.max(0, Math.min(3000, Number(v) || 1200))],
-  [setTs, 'tsCadenceSec', (v) => Math.max(3, Math.min(20, Number(v) || 8))],
-  [chkDebug, 'debug', (v) => !!v],
-]) {
-  el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', () => {
-    settings[key] = coerce(el.type === 'checkbox' ? el.checked : el.value);
-    saveSettings();
-    if (key === 'debug') {
-      document.querySelectorAll('.partial')
-        .forEach(n => (n.style.display = settings.debug ? '' : 'none'));
-    }
-  });
-}
-
-[setSourceTab, setSourcePick, setSourceMic].forEach(r => {
-  r.addEventListener('change', () => {
-    settings.source = setSourceMic.checked ? 'mic' : setSourcePick.checked ? 'pick' : 'tab';
-    saveSettings();
-  });
-});
-
-/* ------------------------- Status / Buttons -------------------------- */
 let _connBase = 'Disconnected';
 function setStatus(t){ elStatus.textContent = t; }
 function setConn(t){ _connBase = t; renderConn(); }
@@ -159,7 +99,7 @@ function setButtons({ start, pause, resume, stop, exportable, canClear }){
 }
 function formatTime(sec){
   sec = Math.max(0, Math.floor(sec));
-  const m = String(Math.floor(sec/60)).padStart(2,'0');
+  const m = String(Math.floor(sec / 60)).padStart(2,'0');
   const s = String(sec % 60).padStart(2,'0');
   return `${m}:${s}`;
 }
@@ -167,95 +107,70 @@ function currentSourceLabel(){
   return settings.source === 'mic' ? 'Mic' : settings.source === 'pick' ? 'Picked Tab' : 'Tab';
 }
 
-/* ----------------------------- Timer -------------------------------- */
-let tInt = null;
-let elapsed = 0;
-function startTimer(){
-  stopTimer();
-  elapsed = 0;
-  elTimer.textContent = formatTime(elapsed);
-  tInt = setInterval(() => {
-    elapsed += 1;
-    elTimer.textContent = formatTime(elapsed);
-  }, 1000);
-}
-function stopTimer(){
-  if (tInt) clearInterval(tInt);
-  tInt = null;
-}
+/* -------------------- Settings UI wire-up -------------------- */
+const setProvider    = qs('#set-provider');
+const setWS          = qs('#set-ws');
+const setSeg         = qs('#set-seg');
+const setOvl         = qs('#set-ovl');
+const setTs          = qs('#set-ts');
+const chkDebug       = qs('#chk-debug');
+const setSourceTab   = qs('#set-source-tab');
+const setSourcePick  = qs('#set-source-pick');
+const setSourceMic   = qs('#set-source-mic');
 
-/* ----------------------- Capture (Tab/Pick/Mic) ---------------------- */
-function startTabCapture(){
-  return new Promise((resolve, reject) => {
-    chrome.tabCapture.capture({ audio: true, video: false }, (stream) => {
-      const err = chrome.runtime.lastError;
-      if (err || !stream) { reject(new Error(err?.message || 'Failed to capture tab audio')); return; }
-      resolve(stream);
-    });
+setProvider.value = settings.provider;
+setWS.checked     = settings.preferWS;
+setSeg.value      = settings.segSec;
+setOvl.value      = settings.overlapMs;
+setTs.value       = settings.tsCadenceSec;
+chkDebug.checked  = settings.debug;
+if (settings.source === 'tab')  setSourceTab.checked  = true;
+if (settings.source === 'pick') setSourcePick.checked = true;
+if (settings.source === 'mic')  setSourceMic.checked  = true;
+
+for (const [el, key, coerce] of [
+  [setProvider, 'provider', String],
+  [setWS,       'preferWS', v => !!v],
+  [setSeg,      'segSec',   v => Math.max(5,  Math.min(60,   Number(v) || 10))],
+  [setOvl,      'overlapMs',v => Math.max(0,  Math.min(3000, Number(v) || 1200))],
+  [setTs,       'tsCadenceSec', v => Math.max(3, Math.min(20, Number(v) || 8))],
+  [chkDebug,    'debug',    v => !!v],
+]){
+  el.addEventListener(el.type === 'checkbox' ? 'change':'input', () => {
+    settings[key] = coerce(el.type === 'checkbox' ? el.checked : el.value);
+    saveSettings();
+    if (key === 'debug') {
+      document.querySelectorAll('.partial')
+        .forEach(n => n.style.display = settings.debug ? '' : 'none');
+    }
   });
 }
-async function startPickerCapture(){
-  const ds = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 1 }, audio: true });
-  const at = ds.getAudioTracks();
-  if (!at.length) {
-    ds.getVideoTracks().forEach(t => t.stop());
-    throw new Error('No audio. Pick “Chrome Tab” and tick “Share tab audio”.');
-  }
-  ds.getVideoTracks().forEach(t => t.stop());
-  return new MediaStream([at[0]]);
-}
-async function startMicCapture(){
-  const s = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    video: false
+[setSourceTab,setSourcePick,setSourceMic].forEach(r => {
+  r.addEventListener('change', () => {
+    if (setSourceTab.checked)  settings.source = 'tab';
+    if (setSourcePick.checked) settings.source = 'pick';
+    if (setSourceMic.checked)  settings.source = 'mic';
+    saveSettings();
   });
-  const at = s.getAudioTracks();
-  if (!at.length) throw new Error('No microphone detected');
-  return new MediaStream([at[0]]);
+});
+
+/* -------------------- Backend URLs -------------------- */
+function wsUrl(){
+  const u = new URL(BACKEND_URL);
+  u.protocol = (u.protocol === 'https:') ? 'wss:' : 'ws:';
+  u.pathname = '/realtime';
+  u.search   = '?enc=webm';
+  return u.toString();
+}
+async function fetchWithTimeout(url, options = {}, timeoutMs = UPLOAD_TIMEOUT_MS){
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: ctrl.signal }); }
+  finally { clearTimeout(id); }
 }
 
-async function getMediaTime(){
-  try{
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) return null;
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        const v = document.querySelector('video,audio');
-        return v ? v.currentTime : null;
-      }
-    });
-    return typeof res?.result === 'number' ? res.result : null;
-  } catch { return null; }
-}
-
-/* -------------------------- Dedup (token) ---------------------------- */
-let tailTokens = [];
-const cleanTok = (w) => w.replace(/^[^A-Za-z0-9']+|[^A-Za-z0-9']+$/g,'').toLowerCase();
-function mergeAndDedup(rawText){
-  const txt = (rawText || '').trim();
-  if (!txt) return '';
-  const newTokens = txt.split(/\s+/);
-  const tailSlice = tailTokens.slice(-DEDUP_MAX_TAIL_WORDS);
-  const tailClean = tailSlice.map(cleanTok).filter(Boolean);
-  const newClean  = newTokens.map(cleanTok).filter(Boolean);
-
-  let overlap = 0;
-  const maxK = Math.min(16, tailClean.length, newClean.length);
-  for (let k = maxK; k >= 2; k--){
-    const a = tailClean.slice(tailClean.length - k).join(' ');
-    const b = newClean.slice(0, k).join(' ');
-    const chars = b.replace(/\s+/g,'').length;
-    if (a === b && (k >= DEDUP_MIN_MATCH_WORDS || chars >= 12)) { overlap = k; break; }
-  }
-  if (overlap >= newTokens.length) return '';
-  const outTokens = newTokens.slice(overlap);
-  tailTokens = [...tailSlice, ...outTokens].slice(-DEDUP_MAX_TAIL_WORDS);
-  return outTokens.join(' ');
-}
-
-/* ---------------------- Transcript entries + UI ---------------------- */
-const entries = [];           // [{t, text}]
+/* -------------------- Transcript store + UI insert -------------------- */
+const entries = []; // sorted by t ascending
 let lastStamp = -Infinity;
 
 function insertTranscriptLine(text, atSeconds){
@@ -263,8 +178,9 @@ function insertTranscriptLine(text, atSeconds){
   const t = typeof atSeconds === 'number' ? atSeconds : elapsed;
 
   let stampThis = false;
-  if (t < lastStamp) stampThis = true;
-  else if (!isFinite(lastStamp) || t - lastStamp >= settings.tsCadenceSec) {
+  if (t < lastStamp) {
+    stampThis = true;
+  } else if (!isFinite(lastStamp) || t - lastStamp >= settings.tsCadenceSec) {
     stampThis = true; lastStamp = t;
   }
 
@@ -277,7 +193,7 @@ function insertTranscriptLine(text, atSeconds){
     const b = document.createElement('button');
     b.className = 'ts';
     b.textContent = `[${formatTime(t)}]`;
-    b.dataset.t = String(Math.floor(t));
+    b.dataset.t   = String(Math.floor(t));
     div.appendChild(b);
     div.appendChild(document.createTextNode(' '));
   }
@@ -298,162 +214,187 @@ function insertTranscriptLine(text, atSeconds){
   persist();
 
   setButtons({
-    start: false,
-    pause: recording || wsMode,
-    resume: !recording && !wsMode && stream,
-    stop: !!stream,
-    exportable: entries.length > 0,
-    canClear: entries.length > 0,
+    start:false, pause:recording || wsMode, resume:!recording && !wsMode && stream,
+    stop:!!stream, exportable:entries.length>0, canClear:entries.length>0
   });
 }
-
 function dbg(msg){
   if (!settings.debug) return;
   const d = document.createElement('div');
-  d.className = 'partial';
+  d.className='partial';
   d.textContent = msg;
   d.style.display = '';
   elTranscript.appendChild(d);
   elTranscript.scrollTop = elTranscript.scrollHeight;
 }
-
 elTranscript.addEventListener('click', async (e) => {
-  const b = e.target.closest('.ts');
-  if (!b) return;
+  const b = e.target.closest('.ts'); if (!b) return;
   const sec = Number(b.dataset.t);
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) return;
-  try{
+  const [tab] = await chrome.tabs.query({ active:true, currentWindow:true }); if (!tab) return;
+  try {
     await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: (s) => { const v = document.querySelector('video,audio'); if (v){ v.currentTime = s; v.play?.(); } },
-      args: [sec]
+      target:{ tabId: tab.id },
+      func:(s) => { const v = document.querySelector('video,audio'); if (v){ v.currentTime = s; v.play?.(); } },
+      args:[sec],
     });
-  } catch { toast('Seek failed: allow site access','warn'); }
+  } catch { toast('Seek failed: allow site access', 'warn'); }
 });
 
-/* ----------------------- Autosave / Exports -------------------------- */
+/* -------------------- Timer -------------------- */
+let tInt = null, elapsed = 0;
+function startTimer(){
+  stopTimer(); elapsed = 0; elTimer.textContent = formatTime(elapsed);
+  tInt = setInterval(() => { elapsed += 1; elTimer.textContent = formatTime(elapsed); }, 1000);
+}
+function stopTimer(){ if (tInt) clearInterval(tInt); tInt = null; }
+
+/* -------------------- Capture helpers -------------------- */
+function startTabCapture(){
+  return new Promise((resolve, reject) => {
+    chrome.tabCapture.capture({ audio:true, video:false }, (stream) => {
+      const err = chrome.runtime.lastError;
+      if (err || !stream) { reject(new Error(err?.message || 'Failed to capture tab audio')); return; }
+      resolve(stream);
+    });
+  });
+}
+async function startPickerCapture(){
+  const ds = await navigator.mediaDevices.getDisplayMedia({ video:{ frameRate:1 }, audio:true });
+  const at = ds.getAudioTracks();
+  if (!at.length){ ds.getVideoTracks().forEach(t=>t.stop()); throw new Error('Pick “Chrome Tab” and tick “Share tab audio”.'); }
+  ds.getVideoTracks().forEach(t=>t.stop());
+  return new MediaStream([at[0]]);
+}
+async function startMicCapture(){
+  const s = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true }, video:false });
+  const at = s.getAudioTracks(); if (!at.length) throw new Error('No microphone detected');
+  return new MediaStream([at[0]]);
+}
+async function getMediaTime(){
+  try {
+    const [tab] = await chrome.tabs.query({ active:true, currentWindow:true });
+    if (!tab) return null;
+    const [res] = await chrome.scripting.executeScript({
+      target:{ tabId: tab.id },
+      func:() => { const v = document.querySelector('video,audio'); return v ? v.currentTime : null; },
+    });
+    return typeof res?.result === 'number' ? res.result : null;
+  } catch { return null; }
+}
+
+/* -------------------- Dedup -------------------- */
+let tailTokens = [];
+const cleanTok = w => w.replace(/^[^A-Za-z0-9']+|[^A-Za-z0-9']+$/g,'').toLowerCase();
+function mergeAndDedup(rawText){
+  const txt = (rawText || '').trim(); if (!txt) return '';
+  const newTokens = txt.split(/\s+/);
+  const tailSlice = tailTokens.slice(-DEDUP_MAX_TAIL_WORDS);
+  const tailClean = tailSlice.map(cleanTok).filter(Boolean);
+  const newClean  = newTokens.map(cleanTok).filter(Boolean);
+  let overlap = 0;
+  const maxK = Math.min(16, tailClean.length, newClean.length);
+  for (let k=maxK;k>=2;k--){
+    const a = tailClean.slice(tailClean.length - k).join(' ');
+    const b = newClean.slice(0,k).join(' ');
+    const chars = b.replace(/\s+/g,'').length;
+    if (a === b && (k >= DEDUP_MIN_MATCH_WORDS || chars >= 12)) { overlap = k; break; }
+  }
+  if (overlap >= newTokens.length) return '';
+  const outTokens = newTokens.slice(overlap);
+  tailTokens = [...tailSlice, ...outTokens].slice(-DEDUP_MAX_TAIL_WORDS);
+  return outTokens.join(' ');
+}
+
+/* -------------------- Autosave / export -------------------- */
 function persist(){ try { localStorage.setItem(LS_TXT, JSON.stringify(entries)); } catch {} }
 function restore(){
-  try{
-    const raw = localStorage.getItem(LS_TXT);
-    if (!raw) return;
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)){
-      elTranscript.textContent = '';
-      entries.length = 0; lastStamp = -Infinity; tailTokens.length = 0;
-      for (const e of arr) insertTranscriptLine(e.text, e.t);
-    }
+  try {
+    const raw = localStorage.getItem(LS_TXT); if (!raw) return;
+    const arr = JSON.parse(raw); if (!Array.isArray(arr)) return;
+    elTranscript.textContent=''; entries.length=0; lastStamp=-Infinity; tailTokens.length=0;
+    for (const e of arr) insertTranscriptLine(e.text, e.t);
   } catch {}
 }
 function toTxt(){ return entries.map(e => `[${formatTime(Math.floor(e.t||0))}] ${e.text}`).join('\n'); }
 function toSrt(){
-  const pad = (n,d=2)=>String(n).padStart(d,'0');
-  const fmt = (sec) => {
+  const pad = (n,d=2) => String(n).padStart(d,'0');
+  const fmt = sec => {
     const ms = Math.max(0, Math.floor(sec*1000));
-    const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000), s = Math.floor((ms%60000)/1000), ms3 = ms%1000;
+    const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000),
+          s = Math.floor((ms%60000)/1000), ms3 = ms%1000;
     return `${pad(h)}:${pad(m)}:${pad(s)},${String(ms3).padStart(3,'0')}`;
   };
   let out = [];
   for (let i=0;i<entries.length;i++){
-    const a = entries[i], b = entries[i+1];
-    const start = a.t || 0;
-    const end   = b ? Math.max(start+1, (b.t || start+3) - 0.2) : start + 3;
+    const a=entries[i], b=entries[i+1];
+    const start = a.t||0;
+    const end   = b ? Math.max(start+1,(b.t||start+3)-0.2) : start+3;
     out.push(`${i+1}\n${fmt(start)} --> ${fmt(end)}\n${a.text}\n`);
   }
   return out.join('\n');
 }
 function download(name, text, mime='text/plain'){
-  const blob = new Blob([text], { type: mime });
+  const blob = new Blob([text], { type:mime });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+  const a = document.createElement('a'); a.href=url; a.download=name; a.click();
   URL.revokeObjectURL(url);
 }
 
-/* ------------------------ Offline Queue (IDB) ------------------------ */
+/* -------------------- Offline queue -------------------- */
 await dbInit().catch(()=>{});
 async function refreshQueueCount(){
   try { offlineQueueCount = await queueCount(); } catch { offlineQueueCount = 0; }
   renderConn();
 }
 
-async function enqueueChunk(blob, seq, t) {
-  const addRecord = async () =>
-    queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
+// Evict oldest when huge; if still failing and online -> post directly
+async function enqueueChunk(blob, seq, t){
+  const addRecord = async () => queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
 
   try {
-    // Hard-cap: if backlog is huge, evict a chunk of the oldest first
     let cnt = await queueCount().catch(() => 0);
-    while (cnt >= BACKLOG_HARD) {
-      const olds = await queueTake(Math.min(25, cnt)).catch(() => []);
+    while (cnt >= BACKLOG_HARD){
+      const olds = await queueTake(Math.min(25,cnt)).catch(()=>[]);
       if (!olds.length) break;
-      await queueRemove(olds.map(o => o.id)).catch(() => {});
+      await queueRemove(olds.map(o=>o.id)).catch(()=>{});
       cnt -= olds.length;
     }
-
-    // Normal soft cleanup if we’re above our preferred size
-    if (cnt >= QUEUE_MAX_ITEMS) {
-      const olds = await queueTake(Math.min(10, cnt)).catch(() => []);
-      if (olds.length) await queueRemove(olds.map(o => o.id)).catch(() => {});
+    if (cnt >= QUEUE_MAX_ITEMS){
+      const olds = await queueTake(Math.min(10,cnt)).catch(()=>[]);
+      if (olds.length) await queueRemove(olds.map(o=>o.id)).catch(()=>{});
     }
-
-    // First attempt to add
     await addRecord();
-  } catch (err) {
-    // Try one eviction + retry
+  } catch {
     try {
-      const olds = await queueTake(20).catch(() => []);
-      if (olds.length) await queueRemove(olds.map(o => o.id)).catch(() => {});
+      const olds = await queueTake(20).catch(()=>[]);
+      if (olds.length) await queueRemove(olds.map(o=>o.id)).catch(()=>{});
       await addRecord();
-    } catch (err2) {
-      // If we’re online and queuing still fails, post this chunk directly
-      if (navigator.onLine) {
+    } catch {
+      if (navigator.onLine){
         try {
           const fd = new FormData();
           fd.append('audio', blob, `seg-${seq}-direct.webm`);
           fd.append('seq', String(seq));
+          dbg(`⬆️ direct-post seg #${seq}`);
           const data = await postWithRetry(fd);
           const raw = (data?.text || '').trim();
-          if (raw) {
+          if (raw){
             const when = typeof t === 'number' ? t : ((await getMediaTime()) ?? elapsed);
             queueRender(raw, when);
           }
           await refreshQueueCount();
-          return; // handled
-        } catch {
-          // fall through to toast
-        }
+          return;
+        } catch { /* fall through */ }
       }
       toast('Failed to queue chunk', 'err');
       return;
     }
   }
-
   await refreshQueueCount();
   startFlushLoop();
 }
 
-
-async function fetchWithTimeout(url, options={}, timeoutMs=UPLOAD_TIMEOUT_MS){
-  const ctrl = new AbortController();
-  const id = setTimeout(()=>ctrl.abort(), timeoutMs);
-  try { return await fetch(url, { ...options, signal: ctrl.signal }); }
-  finally { clearTimeout(id); }
-}
-
-async function postWithRetry(formData, tries=2, delay=300){
-  for (let i=0;i<tries;i++){
-    try{
-      const resp = await fetchWithTimeout(`${BACKEND_URL}/transcribe`, { method:'POST', body: formData }, UPLOAD_TIMEOUT_MS);
-      if (resp.ok) return await resp.json();
-      if (resp.status < 500) throw new Error(`HTTP ${resp.status}`);
-    }catch(e){
-      if (i === tries-1) throw e;
-      await new Promise(r=>setTimeout(r, delay * Math.pow(3,i)));
-    }
-  }
-}
-
+// returns true if it flushed any items
 async function flushQueueOnce(){
   if (!navigator.onLine) return false;
   const items = await queueTake(QUEUE_FLUSH_BATCH).catch(()=>[]);
@@ -463,17 +404,19 @@ async function flushQueueOnce(){
     const fd = new FormData();
     fd.append('audio', it.blob, `queued-${it.seq}-${it.id}.webm`);
     fd.append('seq', String(it.seq));
-    try{
-      dbg(`⬆️ posting queued #${it.seq}`);
+    try {
+      dbg(`⬆️ flushing queued seg #${it.seq}`);
       const data = await postWithRetry(fd);
       const raw = (data?.text || '').trim();
       if (raw){
         const when = typeof it.t === 'number' ? it.t : ((await getMediaTime()) ?? elapsed);
         queueRender(raw, when);
+      } else {
+        dbg('…all overlap (deduped)');
       }
-      await queueRemove([it.id]);
-    }catch{
-      // leave it for next round and stop
+      await queueRemove([it.id]).catch(()=>{});
+    } catch {
+      // stop on first failure; we’ll retry on next tick
       break;
     }
   }
@@ -484,54 +427,51 @@ async function flushQueueOnce(){
 let flushTimer = null;
 function startFlushLoop(){
   if (flushTimer) return;
-  (async()=>{ try{ await flushQueueOnce(); }catch{} })();
-  flushTimer = setInterval(async () => { try{ await flushQueueOnce(); }catch{} }, 2000);
+  // kick an immediate attempt so queued text appears ASAP
+  (async ()=>{ try{ await flushQueueOnce(); } catch{} })();
+  flushTimer = setInterval(async () => { try{ await flushQueueOnce(); } catch{} }, 2000);
 }
-function stopFlushLoop(){ if (flushTimer){ clearInterval(flushTimer); flushTimer = null; } }
+function stopFlushLoop(){ if (flushTimer) { clearInterval(flushTimer); flushTimer = null; } }
 
-// Drain everything first (flush-first) so offline text appears before new online segments
-let flushMode = false;
+// Drain everything before switching back to WS/live
 async function drainQueueFully(){
   if (!navigator.onLine) return;
-  flushMode = true;
-  try{
-    while (await queueCount() > 0 && navigator.onLine){
-      const had = await flushQueueOnce();
-      if (!had) break;
-    }
-  } finally {
-    flushMode = false;
-    await refreshQueueCount();
+  stopFlushLoop();
+  let guard = 0; // prevents infinite loops if queueTake misbehaves
+  while (navigator.onLine && (await queueCount().catch(()=>0)) > 0 && guard++ < 200){
+    const had = await flushQueueOnce();
+    if (!had) break;
   }
+  startFlushLoop();
 }
 
 window.addEventListener('online', () => {
   renderConn();
-  if (offlineQueueCount > 0) toast('Back online — flushing queued chunks','ok');
-  drainQueueFully().then(()=>startFlushLoop()).catch(()=>startFlushLoop());
+  if (offlineQueueCount > 0) toast('Back online — flushing queued chunks', 'ok');
+  drainQueueFully();
 });
 window.addEventListener('offline', () => {
   renderConn();
-  toast('You are offline. Chunks will be queued','warn');
+  toast('You are offline. Chunks will be queued', 'warn');
 });
 
-/* --------------------------- WS streaming ---------------------------- */
-let ws = null, wsMode = false, wsOpen = false;
-let wsRecorder = null;
-let wsProbeInterval = null;
+/* -------------------- WS streaming -------------------- */
+let ws=null, wsMode=false, wsOpen=false;
+let wsRecorder=null;
+let wsProbeInterval=null;
 
-function clearWsProbe(){ if (wsProbeInterval) { clearInterval(wsProbeInterval); wsProbeInterval = null; } }
+function clearWsProbe(){ if (wsProbeInterval){ clearInterval(wsProbeInterval); wsProbeInterval=null; } }
 
 function wsConnect(){
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve,reject)=>{
     try{
       ws = new WebSocket(wsUrl());
-      ws.binaryType = 'arraybuffer';
+      ws.binaryType='arraybuffer';
       const to = setTimeout(()=>{ try{ ws.close(); }catch{} reject(new Error('WS connect timeout')); }, 1500);
-      ws.onopen = ()=>{ clearTimeout(to); wsOpen = true; resolve(); };
+      ws.onopen  = ()=>{ clearTimeout(to); wsOpen=true; resolve(); };
       ws.onerror = ()=>{ clearTimeout(to); reject(new Error('WS error')); };
-      ws.onclose = ()=>{ wsOpen = false; if (wsMode) onWsDropped(); };
-      ws.onmessage = (evt) => {
+      ws.onclose = ()=>{ wsOpen=false; if (wsMode) onWsDropped(); };
+      ws.onmessage = (evt)=>{
         if (typeof evt.data !== 'string') return;
         try{
           const msg = JSON.parse(evt.data);
@@ -539,9 +479,8 @@ function wsConnect(){
           const text = (alt?.transcript || '').trim();
           const isFinal = msg?.is_final === true || msg?.type === 'UtteranceEnd';
           if (text && isFinal){
-            Promise.resolve(getMediaTime().catch(()=>null)).then(s=>{
-              queueRender(text, s ?? elapsed);
-            });
+            const secP = getMediaTime().catch(()=>null);
+            Promise.resolve(secP).then(s => queueRender(text, s ?? elapsed));
           }
         }catch{}
       };
@@ -549,26 +488,25 @@ function wsConnect(){
   });
 }
 function wsStartSending(stream){
-  try{
-    wsRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 160000 });
-  }catch{ wsRecorder = new MediaRecorder(stream, {}); }
-  wsRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0 && ws && wsOpen){
-      e.data.arrayBuffer().then(buf => { try{ ws.send(buf); }catch{}; });
+  try { wsRecorder = new MediaRecorder(stream, { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond:160000 }); }
+  catch { wsRecorder = new MediaRecorder(stream, {}); }
+  wsRecorder.ondataavailable = (e)=>{
+    if (e.data && e.data.size>0 && ws && wsOpen){
+      e.data.arrayBuffer().then(buf => { try{ ws.send(buf); }catch{} });
     }
   };
-  wsRecorder.start(300); // 300ms frames
+  wsRecorder.start(300);
 }
 function wsStop(){
-  try{ wsRecorder && wsRecorder.state !== 'inactive' && wsRecorder.stop(); }catch{}
-  wsRecorder = null;
-  try{ ws && ws.readyState === WebSocket.OPEN && ws.close(); }catch{}
-  ws = null; wsOpen = false; wsMode = false;
+  try{ wsRecorder && wsRecorder.state!=='inactive' && wsRecorder.stop(); }catch{}
+  wsRecorder=null;
+  try{ ws && ws.readyState===WebSocket.OPEN && ws.close(); }catch{}
+  ws=null; wsOpen=false; wsMode=false;
 }
 function onWsDropped(){
-  wsMode = false;
-  try{ wsRecorder && wsRecorder.state !== 'inactive' && wsRecorder.stop(); }catch{}
-  wsRecorder = null;
+  wsMode=false;
+  try{ wsRecorder && wsRecorder.state!=='inactive' && wsRecorder.stop(); }catch{}
+  wsRecorder=null;
   if (stream){
     if (!recording){
       recording = true;
@@ -576,116 +514,110 @@ function onWsDropped(){
       setStatus(`Recording (fallback) — ${currentSourceLabel()}`);
       startRecorder();
       setButtons({ start:false, pause:true, resume:false, stop:true, exportable:entries.length>0, canClear:true });
-      toast('WebSocket dropped — using fallback','warn');
+      toast('WebSocket dropped — using fallback', 'warn');
     }
     if (settings.preferWS) startWsProbe();
   }
 }
 function startWsProbe(){
   clearWsProbe();
-  wsProbeInterval = setInterval(async () => {
+  wsProbeInterval = setInterval(async ()=>{
     if (!settings.preferWS){ clearWsProbe(); return; }
     if (wsMode || !stream) return;
-    try{ if (await queueCount() > 0) return; } catch {}
+    // If backlog exists, drain it first to show queued text before we switch back
+    try{ if (await queueCount() > 0) return; }catch{}
     try{
       await wsConnect();
-      wsMode = true;
+      wsMode=true;
       setConn('Reconnected (WS)');
       setStatus(`Streaming (${settings.provider}) — ${currentSourceLabel()}`);
       wsStartSending(stream);
-      if (recording){ recording = false; abortAll(); }
+      if (recording){ recording=false; abortAll(); }
       setButtons({ start:false, pause:true, resume:false, stop:true, exportable:entries.length>0, canClear:true });
       toast('Switched back to WebSocket streaming','ok');
       clearWsProbe();
-    }catch{ /* keep probing */ }
+    }catch{/* keep probing */}
   }, 12000);
 }
 
-/* ------------------------- Fallback recorder ------------------------- */
+/* -------------------- Fallback recorder (segmented) -------------------- */
 const ACTIVE = new Set();
-let segIndex = 0;
-let allowOverlap = true;
-
-let stream = null;     // <— define BEFORE any use
-let recording = false; // <— define BEFORE any use
+let segIndex = 0, allowOverlap = true;
 
 function makeRecOpts(){
   const list = [
-    { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 160000 },
-    { mimeType: 'audio/webm',            audioBitsPerSecond: 160000 },
-    { audioBitsPerSecond: 160000 },
+    { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond:160000 },
+    { mimeType:'audio/webm',             audioBitsPerSecond:160000 },
+    { audioBitsPerSecond:160000 },
   ];
-  return (list.find(o => { try{ return o.mimeType ? MediaRecorder.isTypeSupported(o.mimeType) : true; }catch{ return false; } }) || {});
+  return list.find(o=>{ try{ return o.mimeType ? MediaRecorder.isTypeSupported(o.mimeType) : true; }catch{ return false; } }) || {};
 }
-
 function stopRecorder(R){
   if (!R) return;
-  try{
-    if (R.mr && R.mr.state === 'recording'){
-      // Ensure we get a final dataavailable before stopping
-      try { R.mr.requestData(); } catch {}
-      setTimeout(() => { try{ R.mr.stop(); }catch{} }, 20);
-    }
-  }catch{}
-  if (R.stopT){ clearTimeout(R.stopT); R.stopT = null; }
-  if (R.spawnT){ clearTimeout(R.spawnT); R.spawnT = null; }
+  try{ if (R.mr && R.mr.state!=='inactive') R.mr.stop(); }catch{}
+  if (R.stopT){  clearTimeout(R.stopT);  R.stopT=null; }
+  if (R.spawnT){ clearTimeout(R.spawnT); R.spawnT=null; }
 }
 function abortAll(){ for (const R of Array.from(ACTIVE)) stopRecorder(R); ACTIVE.clear(); }
+
+async function postWithRetry(formData, tries=2, delay=300){
+  for (let i=0;i<tries;i++){
+    try{
+      const resp = await fetchWithTimeout(`${BACKEND_URL}/transcribe`, { method:'POST', body:formData }, UPLOAD_TIMEOUT_MS);
+      if (resp.ok) return await resp.json();
+      if (resp.status < 500) throw new Error(`HTTP ${resp.status}`);
+    }catch(e){
+      if (i === tries-1) throw e;
+      await new Promise(r => setTimeout(r, delay * Math.pow(3,i))); // 300, 900
+    }
+  }
+}
 
 function startRecorder(){
   if (!recording || !stream) return;
 
-  if (!allowOverlap){
-    for (const R of Array.from(ACTIVE)) stopRecorder(R);
-  }
+  if (!allowOverlap){ for (const R of Array.from(ACTIVE)) stopRecorder(R); }
 
-  const R = { idx: ++segIndex, chunks: [], mr: null, stopT: null, spawnT: null, t: null };
+  const R = { idx: ++segIndex, chunks:[], mr:null, stopT:null, spawnT:null, t:null };
   getMediaTime().then(s => { R.t = (typeof s === 'number') ? s : elapsed; }).catch(()=>{ R.t = elapsed; });
 
   const opts = makeRecOpts();
-  try { R.mr = new MediaRecorder(stream, opts); }
+  try{ R.mr = new MediaRecorder(stream, opts); }
   catch(e){
     if (allowOverlap){
       allowOverlap = false; dbg('⚠️ overlap not supported; switching to no-overlap');
-      abortAll();
-      if (recording) startRecorder();
-      return;
+      abortAll(); if (recording) startRecorder(); return;
     } else { setStatus(`MediaRecorder error: ${e.message}`); return; }
   }
 
-  // ALWAYS collect data while recording (timeslice)
-  R.mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) R.chunks.push(e.data); };
-  R.mr.onerror = (e) => setStatus(`Recorder error: ${e.error?.name || e.name}`);
-
-  R.mr.onstop = async () => {
+  R.mr.ondataavailable = (e)=>{ if (e.data && e.data.size>0) R.chunks.push(e.data); };
+  R.mr.onerror = (e)=> setStatus(`Recorder error: ${e.error?.name || e.name}`);
+  R.mr.onstop = async ()=>{
     ACTIVE.delete(R);
-    const blob = R.chunks.length ? new Blob(R.chunks, { type: R.chunks[0]?.type || 'audio/webm' }) : null;
+    const blob = R.chunks.length ? new Blob(R.chunks, { type:R.chunks[0]?.type || 'audio/webm' }) : null;
     R.chunks = [];
-
     if (blob){
+      // Decide: queue vs direct post
       const backlog = offlineQueueCount;
-      const preferQueue = !navigator.onLine || flushMode || (backlog > 0 && backlog < BACKLOG_SOFT);
-      if (preferQueue) {
+      const preferQueue = !navigator.onLine || (backlog > 0 && backlog < BACKLOG_SOFT);
+      if (preferQueue){
+        dbg('📥 enqueue (offline or backlog present)');
         await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
+        if (navigator.onLine) startFlushLoop();
       } else {
-        // Try to post now; if it fails, fall back to queue
         const fd = new FormData();
         fd.append('audio', blob, `seg-${R.idx}-${Date.now()}.webm`);
         fd.append('seq', String(R.idx));
-        try {
+        try{
           dbg(`⬆️ posting seg #${R.idx}`);
           const data = await postWithRetry(fd);
           const raw = (data?.text || '').trim();
-          if (raw) {
+          if (raw){
             const when = typeof R.t === 'number' ? R.t : ((await getMediaTime()) ?? elapsed);
             queueRender(raw, when);
-          } else {
-            dbg('…all overlap (deduped)');
-          }
-          if (offlineQueueCount > 0 && navigator.onLine) {
-            await flushQueueOnce().catch(() => {});
-          }
-        } catch {
+          } else { dbg('…all overlap (deduped)'); }
+          if (offlineQueueCount > 0 && navigator.onLine){ await flushQueueOnce().catch(()=>{}); }
+        }catch{
           dbg('❌ inline post failed; queued');
           await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
           startFlushLoop();
@@ -695,26 +627,22 @@ function startRecorder(){
     if (recording && !allowOverlap) startRecorder();
   };
 
-  // Timeslice ensures dataavailable fires while recording
-  try { R.mr.start(1000); } catch { R.mr.start(); }
+  R.mr.start();
   ACTIVE.add(R);
   dbg(`[${formatTime(elapsed)}] 🎬 segment #${R.idx} started`);
-
-  R.stopT = setTimeout(() => stopRecorder(R), settings.segSec * 1000);
+  R.stopT = setTimeout(()=>stopRecorder(R), settings.segSec * 1000);
   if (allowOverlap){
-    R.spawnT = setTimeout(() => { if (recording) startRecorder(); },
-      Math.max(0, settings.segSec * 1000 - settings.overlapMs));
+    R.spawnT = setTimeout(()=>{ if (recording) startRecorder(); }, Math.max(0, settings.segSec*1000 - settings.overlapMs));
   }
 }
 
-/* --------------------------- Render buffer --------------------------- */
+/* -------------------- Render buffer -------------------- */
 let renderBuf = []; // [{t, text, at}]
 let renderTimer = null;
 let maxTSeen = -Infinity;
 
 function queueRender(rawText, t){
-  const text = (rawText || '').trim();
-  if (!text) return;
+  const text = (rawText || '').trim(); if (!text) return;
   const when = (typeof t === 'number') ? t : elapsed;
   maxTSeen = Math.max(maxTSeen, when);
   renderBuf.push({ t: when, text, at: performance.now() });
@@ -727,17 +655,13 @@ function queueRender(rawText, t){
   ensureRenderTimer();
 }
 function ensureRenderTimer(){ if (!renderTimer) renderTimer = setInterval(flushRenderable, 700); }
-function stopRenderTimer(){ if (renderTimer){ clearInterval(renderTimer); renderTimer = null; } }
+function stopRenderTimer(){ if (renderTimer){ clearInterval(renderTimer); renderTimer=null; } }
 function flushRenderable(){
   if (renderBuf.length === 0){ stopRenderTimer(); return; }
   renderBuf.sort((a,b)=> (a.t===b.t ? a.at-b.at : a.t-b.t));
-  const out = [];
-  const now = performance.now();
-  const horizon = maxTSeen - REORDER_SECS;
-  const remain = [];
+  const out=[], now=performance.now(), horizon = maxTSeen - REORDER_SECS, remain=[];
   for (const item of renderBuf){
-    if (item.t <= horizon || now - item.at > MAX_WAIT_MS) out.push(item);
-    else remain.push(item);
+    if (item.t <= horizon || (now - item.at) > MAX_WAIT_MS) out.push(item); else remain.push(item);
   }
   renderBuf = remain;
   for (const it of out){
@@ -747,65 +671,77 @@ function flushRenderable(){
   if (renderBuf.length === 0) stopRenderTimer();
 }
 
-/* --------------------- Fresh start + initial state ------------------- */
+/* -------------------- Session state -------------------- */
+let stream=null;
+let recording=false;
+
+function resetSessionKeepTranscript(){
+  lastStamp = -Infinity;
+  tailTokens.length = 0;
+  segIndex = 0;
+  allowOverlap = true;
+}
+
+/* ---- Fresh-start helpers (wipe transcript + backlog + timers) ---- */
 function clearTranscriptStateAndUI(){
   stopRenderTimer();
   elTranscript.textContent = '';
-  entries.length = 0; lastStamp = -Infinity; tailTokens.length = 0;
-  renderBuf = []; maxTSeen = -Infinity;
+  entries.length = 0;
+  lastStamp = -Infinity;
+  tailTokens.length = 0;
+  renderBuf = [];
+  maxTSeen = -Infinity;
   persist();
   setButtons({ start:true, pause:false, resume:false, stop:!!stream, exportable:false, canClear:false });
 }
 async function clearQueuedBacklog(){
   stopFlushLoop();
-  try{
+  try {
     let remaining = await queueCount().catch(()=>0);
     while (remaining > 0){
-      const batch = await queueTake(Math.min(50, remaining)).catch(()=>[]);
+      const batch = await queueTake(Math.min(50,remaining)).catch(()=>[]);
       if (!batch.length) break;
       await queueRemove(batch.map(b=>b.id)).catch(()=>{});
       remaining -= batch.length;
     }
-  }catch{}
-  offlineQueueCount = 0; renderConn();
-}
-async function startFresh(){
-  clearWsProbe();
-  if (wsMode) wsStop();
-  recording = false;
-  abortAll();
-  try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch{}
-  stream = null;
-  stopTimer();
-
-  clearTranscriptStateAndUI();
-  await clearQueuedBacklog();
-  try{ localStorage.removeItem(LS_TXT); }catch{}
+  } catch {}
+  offlineQueueCount = 0;
+  renderConn();
 }
 
-/* --------------------------- Initial UI ------------------------------ */
+/* -------------------- UI init -------------------- */
 setConn('Disconnected');
 setStatus('Idle');
-setButtons({ start:true, pause:false, resume:false, stop:false, exportable:false, canClear:false });
-
+setButtons({ start:true, pause:false, resume:false, stop:false, exportable:entries.length>0, canClear:entries.length>0 });
 if (AUTO_RESTORE) restore(); else { try{ localStorage.removeItem(LS_TXT); }catch{} }
-document.querySelectorAll('.partial').forEach(n => (n.style.display = settings.debug ? '' : 'none'));
+document.querySelectorAll('.partial').forEach(n=> n.style.display = settings.debug ? '' : 'none');
 refreshQueueCount().then(()=>{ if (offlineQueueCount > 0) startFlushLoop(); });
 
-/* ------------------------------ UI ---------------------------------- */
+/* -------------------- UI actions -------------------- */
 btnStart.addEventListener('click', async () => {
   try{
     setStatus('Starting…');
     setButtons({ start:false, pause:false, resume:false, stop:false, exportable:entries.length>0, canClear:entries.length>0 });
 
-    await startFresh();          // <- nuke old transcript + backlog every time
+    // *** Start = clean slate ***
+    clearWsProbe();
+    if (wsMode) wsStop();
+    recording = false;
+    abortAll();
+    try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch{}
+    stream=null;
+    stopTimer();
+    clearTranscriptStateAndUI();
+    await clearQueuedBacklog();               // <-- wipe backlog to 0
+    try{ localStorage.removeItem(LS_TXT); }catch{}
 
+    // capture
     try{
       if (settings.source === 'tab'){
-        try { stream = await startTabCapture(); }
+        try{ stream = await startTabCapture(); }
         catch{ setStatus('Picker: choose this tab & tick “Share tab audio”'); stream = await startPickerCapture(); }
-      } else if (settings.source === 'pick'){ stream = await startPickerCapture(); }
-      else { stream = await startMicCapture(); }
+      } else if (settings.source === 'pick') stream = await startPickerCapture();
+      else stream = await startMicCapture();
     }catch(e){
       setStatus(`Capture error: ${e.message}`);
       setButtons({ start:true, pause:false, resume:false, stop:false, exportable:entries.length>0, canClear:entries.length>0 });
@@ -823,11 +759,11 @@ btnStart.addEventListener('click', async () => {
         setConn('Connected (WS)');
         setStatus(`Streaming (${settings.provider}) — ${currentSourceLabel()}`);
         wsStartSending(stream);
-        toast(`Streaming ${currentSourceLabel()}`,'ok');
+        toast(`Streaming ${currentSourceLabel()}`, 'ok');
         return;
       }catch{
         setConn('WS unavailable → fallback');
-        toast('WS not ready, using fallback','warn');
+        toast('WS not ready, using fallback', 'warn');
         startWsProbe();
       }
     }
@@ -837,40 +773,55 @@ btnStart.addEventListener('click', async () => {
     setStatus(`Recording (fallback) — ${currentSourceLabel()}`);
     startRecorder();
     if (offlineQueueCount > 0) startFlushLoop();
-
   }catch(err){
     setStatus(`Error: ${err.message}`);
     setButtons({ start:true, pause:false, resume:false, stop:false, exportable:entries.length>0, canClear:entries.length>0 });
   }
 });
 
-btnPause.addEventListener('click', () => {
-  if (wsMode){ try{ wsRecorder?.stop(); }catch{} setStatus('Paused (WS)'); }
-  else {
+btnPause.addEventListener('click', ()=>{
+  if (wsMode){
+    try{ wsRecorder?.stop(); }catch{}
+    setStatus('Paused (WS)');
+  } else {
     if (!recording) return;
-    recording = false; abortAll(); setStatus('Paused');
+    recording = false;
+    abortAll();
+    setStatus('Paused');
   }
   setButtons({ start:false, pause:false, resume:true, stop:true, exportable:entries.length>0, canClear:true });
 });
-btnResume.addEventListener('click', () => {
-  if (wsMode){ wsStartSending(stream); setStatus(`Streaming (${settings.provider}) — ${currentSourceLabel()}`); }
-  else { if (recording) return; recording = true; startRecorder(); setStatus(`Recording (fallback) — ${currentSourceLabel()}`); }
+btnResume.addEventListener('click', ()=>{
+  if (wsMode){
+    wsStartSending(stream);
+    setStatus(`Streaming (${settings.provider}) — ${currentSourceLabel()}`);
+  } else {
+    if (recording) return;
+    recording = true;
+    startRecorder();
+    setStatus(`Recording (fallback) — ${currentSourceLabel()}`);
+  }
   setButtons({ start:false, pause:true, resume:false, stop:true, exportable:entries.length>0, canClear:true });
 });
-btnStop.addEventListener('click', () => {
+btnStop.addEventListener('click', ()=>{
   clearWsProbe();
   if (wsMode) wsStop();
-  recording = false; abortAll();
+  recording=false; abortAll();
   try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch{}
-  stream = null; stopTimer();
+  stream=null;
+  stopTimer();
   setStatus('Stopped'); setConn('Disconnected'); toast('Stopped','ok');
   setButtons({ start:true, pause:false, resume:false, stop:false, exportable:entries.length>0, canClear:entries.length>0 });
 });
 
-btnCopy.addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(toTxt()); toast('Copied','ok'); }catch{ toast('Copy failed','err'); }});
-btnDownload.addEventListener('click', ()=>download(`transcript-${Date.now()}.txt`, toTxt()));
-btnExportSrt.addEventListener('click', ()=>download(`transcript-${Date.now()}.srt`, toSrt(), 'text/srt'));
-btnExportJson.addEventListener('click', ()=>download(`transcript-${Date.now()}.json`, JSON.stringify(entries,null,2), 'application/json'));
-btnClear.addEventListener('click', () => {
-  clearTranscriptStateAndUI();
+btnCopy.addEventListener('click', async ()=>{
+  try{ await navigator.clipboard.writeText(toTxt()); toast('Copied','ok'); }
+  catch{ toast('Copy failed','err'); }
+});
+btnDownload.addEventListener('click', ()=> download(`transcript-${Date.now()}.txt`, toTxt()));
+btnExportSrt.addEventListener('click', ()=> download(`transcript-${Date.now()}.srt`, toSrt(), 'text/srt'));
+btnExportJson.addEventListener('click', ()=> download(`transcript-${Date.now()}.json`, JSON.stringify(entries,null,2), 'application/json'));
+btnClear.addEventListener('click', ()=>{
+  elTranscript.textContent=''; entries.length=0; lastStamp=-Infinity; tailTokens.length=0; persist();
+  setButtons({ start:true, pause:false, resume:false, stop:!!stream, exportable:false, canClear:false });
 });
