@@ -18,6 +18,11 @@ const defaultSettings = {
   debug: false,
   source: 'tab', // 'tab' | 'pick' | 'mic'
 };
+
+// ----- Session state (MUST be declared before use) -----
+let stream = null;     // current MediaStream (tab/mic/picker)
+let recording = false; // true when chunked fallback recorder is running
+
 const settings = Object.assign({}, defaultSettings, loadSettings());
 function loadSettings(){ try{ return JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}'); }catch{ return {}; } }
 function saveSettings(){ localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); }
