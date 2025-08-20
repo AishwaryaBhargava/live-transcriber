@@ -928,20 +928,86 @@ refreshQueueCount().then(() => {
   if (offlineQueueCount > 0) startFlushLoop();
 });
 
+// --- Fresh-start helpers: clear transcript + queued chunks + timers ---
+function clearTranscriptStateAndUI() {
+  // stop any reordering timer
+  stopRenderTimer?.();
+
+  // clear DOM
+  elTranscript.textContent = '';
+
+  // clear in-memory state
+  entries.length = 0;
+  lastStamp = -Infinity;
+  tailTokens.length = 0;
+
+  // render buffer
+  renderBuf = [];
+  maxTSeen = -Infinity;
+
+  // persist empty
+  persist();
+  setButtons({
+    start: true,
+    pause: false,
+    resume: false,
+    stop: !!stream,
+    exportable: false,
+    canClear: false
+  });
+}
+
+// Delete everything in the offline queue (IndexedDB)
+async function clearQueuedBacklog() {
+  try {
+    // stop any periodic flusher
+    if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+
+    let remaining = await queueCount().catch(() => 0);
+    while (remaining > 0) {
+      const batch = await queueTake(Math.min(50, remaining)).catch(() => []);
+      if (!batch.length) break;
+      await queueRemove(batch.map(b => b.id)).catch(() => {});
+      remaining -= batch.length;
+    }
+  } catch {}
+  offlineQueueCount = 0;
+  renderConn();
+}
+
+// One call we can await at the top of Start
+async function startFresh() {
+  // Ensure no leftover recorders/timers are running
+  clearWsProbe?.();
+  if (wsMode) wsStop();
+  recording = false;
+  abortAll();
+  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
+  stream = null;
+  stopTimer();
+
+  // Nuke transcript + backlog
+  clearTranscriptStateAndUI();
+  await clearQueuedBacklog();
+
+  // Also ensure autosave store is empty
+  try { localStorage.removeItem(LS_TXT); } catch {}
+}
+
 // ----- UI actions -----
 btnStart.addEventListener('click', async () => {
   try {
     setStatus('Starting…');
     setButtons({
-      start: false,
-      pause: false,
-      resume: false,
-      stop: false,
-      exportable: entries.length > 0,
-      canClear: entries.length > 0,
+      start: false, pause: false, resume: false, stop: false,
+      exportable: entries.length > 0, canClear: entries.length > 0
     });
-    resetSessionKeepTranscript();
-    clearWsProbe();
+
+    // Always begin clean: no old transcript, no queued chunks, no stale timers
+    await startFresh();
+    // Wipe transcript & backlog on stop as well (optional)
+    clearTranscriptStateAndUI();
+    clearQueuedBacklog();
 
     try {
       if (settings.source === 'tab') {
