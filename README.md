@@ -1,177 +1,143 @@
-# TwinMind Tab Transcriber
+# Live Transcriber — Chrome Side Panel
 
-Chrome side-panel extension that **transcribes the current tab, a picked tab, or your microphone** in near-realtime using **Deepgram**.  
-It auto-switches between **Realtime (WebSocket)** and **Fallback (chunked uploads)**, and has an **offline queue** that buffers audio locally and flushes when you’re back online. Exports to **.txt**, **.srt**, and **.json**.
+Real-time tab/mic transcription with **Deepgram Realtime** + **chunked fallback**. Works even **offline**: audio chunks are queued locally and flushed first when you reconnect. Click timestamps to seek your tab’s video/audio.
+
+> Backend: https://live-transcriber-0md8.onrender.com (Render Free)
 
 ---
 
 ## ✨ Features
 
-- **Sources:** Active Tab, “Pick a Tab” (Chrome picker), or Microphone
-- **Realtime (WS)** + **Fallback (chunked)** with automatic switching both ways
-- **Offline-first queue** (IndexedDB) with time anchors; auto-flush on reconnect
-- **Word-level de-dup** across overlapped chunks
-- **Timestamp badges** every N seconds (click to seek the page’s video/audio)
-- **Light/Dark theme** toggle; compact UI; settings modal & export sheet
-- **Exports:** Copy, `.txt`, `.srt`, `.json`
-- **Autosave/restore** transcript and **persisted settings**
+- Chrome **Side Panel** UI — works on any page
+- **WebSocket streaming** (Deepgram) with **automatic fallback** to chunked uploads
+- **Offline mode**: queues audio in IndexedDB, **flush-first** on reconnect
+- **Time-anchored** lines + click-to-seek in the active tab
+- **Exports**: TXT / SRT / JSON
+- Settings: source (Tab / Pick a Tab / Mic), segment length, overlap, timestamp cadence
+- Built for flaky networks (backoff, retry, queue drain)
 
 ---
 
-## 🧱 Project Layout
+## 🧩 Install (Developer mode)
 
-```
-repo/
-  backend/
-    server.js            # Express + Deepgram (WS relay + chunked)
-    package.json
-    .env.example
-  extension/
-    manifest.json
-    sidepanel/
-      index.html
-      panel.css
-      main.js
-    lib/
-      db.js              # IndexedDB queue helpers (idb)
-    background/
-      sw.js
-```
+**Option A — from GitHub Release (recommended)**
+1. Download the ZIP from the latest release: **Releases → Assets → `Live-Transcriber.zip`**.
+2. Unzip it somewhere you keep dev extensions.
+3. Open **chrome://extensions** → toggle **Developer mode** (top right).
+4. Click **Load unpacked** → select the unzipped folder (the folder that contains `manifest.json`).
+5. Pin the extension and open the **side panel**.
 
-**Backend**
-- `POST /transcribe` — accepts audio chunks (webm/opus) → `{ text, seq }`
-- `WS /realtime` — streams audio to Deepgram; relays back interim/final transcripts
-
-**Side-panel**
-- Captures audio via `tabCapture`, `getDisplayMedia` (picker), or `getUserMedia` (mic)
-- Prefers WS; falls back to chunked; can later switch back to WS
-- Queues while offline; flushes in order when online; adds timestamp badges
-- Dedups overlap; autosaves to `localStorage`
-
----
-
-## 🔧 Prerequisites
-
-- **Node 18+**
-- **Chrome 120+**
-- **Deepgram API key** (free tier available)
-
----
-
-## 🚀 Setup
-
-### 1) Backend
-
+**Option B — build locally**
 ```bash
-cd backend
-npm install
-cp .env.example .env  # put your key
+# from repo root
+npm run zip
+# unzip dist/Live-Transcriber.zip and Load unpacked as above
+````
+
+---
+
+## 🚀 Quick start
+
+1. Open a tab with media (YouTube, Meet, etc.) or pick **Mic** in Settings.
+2. Open the **side panel** → click **Start**.
+3. If using **Pick a Tab**, choose “Chrome Tab” and tick **Share tab audio**.
+4. Watch live transcript appear. Go offline—text is queued. Reconnect—offline text posts **first**, then live.
+
+---
+
+## 🔧 Backend (Render) notes
+
+The extension talks to:
+
+```
+https://live-transcriber-0md8.onrender.com
 ```
 
-Edit `.env`:
+Environment on Render (already set up):
 
-```
-PORT=8080
-DEEPGRAM_API_KEY=YOUR_DEEPGRAM_KEY
-# Optional:
-# DG_MODEL=nova-2
-```
+* `DEEPGRAM_API_KEY` — required
+* `DG_MODEL` — `nova-2` (or your preferred)
+* `ALLOWED_ORIGINS` — must include:
 
-Run:
+  * `chrome-extension://*`
+  * `http://localhost` `http://127.0.0.1`
+  * (and any future site where you host a dev page)
 
-```bash
-npm start
-# or
-node server.js
-```
+The backend exposes:
 
-Verify health: http://localhost:8080/health → `{"ok":true}`
+* `GET /health` — health info
+* `POST /transcribe` — chunked fallback
+* `WS /realtime` — Deepgram passthrough
 
-### 2) Extension
-
-1. Open `chrome://extensions` → enable **Developer mode**.
-2. **Load unpacked** → select the `extension/` folder.
-3. Pin the side-panel icon (optional).
-4. Open a normal site (YouTube, etc.), open the **side panel**.
-
-> If you see “Access requested”, click it to allow the extension on that site.
+> **Free tier note:** Render Free may cold start; first request can be slow. The extension has a tuned timeout to detect this and queue gracefully.
 
 ---
 
-## 🧪 Using It
+## 🛠 Permissions used (why)
 
-1. Click **⚙ Settings** → choose **Source** (Tab / Pick / Mic), adjust segment length, overlap, timestamp cadence, WS preference, etc.
-2. **Start**.  
-   - Status shows **Streaming (Deepgram)** for WS, or **Recording (fallback)** for chunked.
-3. **Pause**, **Resume**, **Stop** as needed.
-4. **Timestamps** appear every N seconds; click to seek the page’s video/audio (where allowed).
-5. **Export** via the download icon → `.txt`, `.srt`, `.json` or **Copy**.
-
----
-
-## 🌐 Offline Behavior
-
-- When the network drops, uploads time out quickly and chunks are **queued** in IndexedDB with their start-time anchor.
-- A toast shows the queued count; the **Connection** label shows “queued N”.
-- On reconnect, the queue **flushes automatically**.  
-- Online and queued segments might interleave; timestamps keep reading order sensible.
-
-> Audio played entirely while offline can’t be re-captured after reconnect — we rely on chunks recorded during the outage.
+* `tabCapture` — capture the current tab’s audio (primary mode)
+* `scripting` — inject a tiny script to **seek** the tab when you click a timestamp
+* `storage` — save settings + transcript (optional)
+* `sidePanel` — the UI lives in the side panel
+* `activeTab` — access the active tab for seeking and capture prompts
 
 ---
 
-## ⚙ Settings (⚙ modal)
+## ⏱️ Exports
 
-- **Provider**: Deepgram
-- **Prefer realtime (WS)**: try WS first
-- **Segment length** (default 10s)
-- **Overlap** (default 1200ms)
-- **Timestamp cadence** (default 8s)
-- **Debug logs**
-- **Source**: Tab / Pick / Mic
-
-All settings persist.
+* **TXT** — `[mm:ss] your text`
+* **SRT** — numbered cues, \~3s default last line
+* **JSON** — `[{ t, text }, …]`
 
 ---
 
-## 🔐 Permissions
+## 🧰 Troubleshooting
 
-- `tabCapture`, `activeTab`, `sidePanel`, `tabs`, `scripting`, `storage`
-- Host permissions: `<all_urls>` (narrow if you wish)
+* **No audio / “No audio. Pick ‘Chrome Tab’…”**
+  Use **Pick a Tab** and tick **Share tab audio** (Chrome dialog). Some sites block tabCapture.
 
----
+* **Shows “Connected — queued N” but no lines appear**
+  You’re offline or Render is cold-starting. Chunks are being **queued**. They will post automatically (flush-first) once the server responds.
 
-## 🧰 Dev Scripts (backend)
+* **“Failed to queue chunk”**
+  Browser is out of IndexedDB quota for the extension. Fix: **chrome://extensions** → this extension → **Service worker section → Inspect views** → Application → Clear storage → Clear site data. Then restart transcription.
 
-```json
-{
-  "name": "twinmind-backend",
-  "private": true,
-  "type": "commonjs",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  }
-}
-```
+* **CORS**
+  If you self-host, set `ALLOWED_ORIGINS` on the backend to include `chrome-extension://*` and (for local testing) `http://localhost`, `http://127.0.0.1`.
 
----
-
-## 📦 Pack the Extension (optional)
-
-In `chrome://extensions` → **Pack extension** → choose `extension/`.
-
----
-
-## 🧯 Troubleshooting
-
-- **No side panel/permission toast**: allow the extension on that site.
-- **Picker gives no audio**: you must choose **Chrome Tab** and tick **Share tab audio**.
-- **Nothing after offline/online**: ensure backend is running; queue flushes only when online and server reachable.
-- **CORS**: backend is permissive for dev; harden for prod if needed.
+* **Timestamps out of order**
+  The UI holds recent lines briefly to let earlier offline lines arrive, then renders chronologically. This is normal.
 
 ---
 
 ## 🔒 Privacy
 
-Only audio → Deepgram for transcription; no extra tracking. Clear transcript with **Clear**.
+* Audio is captured locally and sent only to **your** backend.
+* Offline chunks live in IndexedDB temporarily and are deleted after successful posting.
+* The extension does not store transcripts server-side.
+
+---
+
+## 🧑‍💻 Development
+
+```bash
+# Lint & format
+npm run lint
+npm run format
+npm run check
+
+# Start backend locally (if needed)
+npm run start:server
+```
+
+---
+
+## 📝 License
+
+ISC
+
+---
+
+## 🙏 Credits
+
+* Deepgram SDK / API for speech-to-text.
