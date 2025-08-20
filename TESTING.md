@@ -3,9 +3,9 @@
 This document describes how to verify the Chrome side-panel extension end-to-end, including realtime (WS), fallback uploading, offline queueing, chronological rendering, seeking, and exports.
 
 > Repo: [https://github.com/AishwaryaBhargava/live-transcriber](https://github.com/AishwaryaBhargava/live-transcriber)
-> Release ZIP: [https://github.com/AishwaryaBhargava/live-transcriber/releases/tag/v1.0.0](https://github.com/AishwaryaBhargava/live-transcriber/releases/tag/v1.0.0)
-> Backend (Render): `https://live-transcriber-0md8.onrender.com`
-> Issues: [https://github.com/AishwaryaBhargava/live-transcriber/issues](https://github.com/AishwaryaBhargava/live-transcriber/issues)
+> > Release ZIP: [https://github.com/AishwaryaBhargava/live-transcriber/releases/tag/v1.0.0](https://github.com/AishwaryaBhargava/live-transcriber/releases/tag/v1.0.0)
+> > > Backend (Render): `https://live-transcriber-0md8.onrender.com`
+> > > > Issues: [https://github.com/AishwaryaBhargava/live-transcriber/issues](https://github.com/AishwaryaBhargava/live-transcriber/issues)
 
 ---
 
