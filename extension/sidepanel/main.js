@@ -1,5 +1,5 @@
 // ===== Live Transcriber sidepanel (Tab / Pick / Mic) =====
-// WS-first with chunked fallback, offline queue with eviction + direct-post fallback,
+// WS-first with chunked fallback, offline queue (eviction + direct-post fallback),
 // queued-first drain on reconnect, ordered rendering with timestamp badges,
 // and "Start = clean slate" (transcript + backlog zeroed).
 
@@ -42,12 +42,14 @@ const MAX_WAIT_MS  = 7000; // or flush by age
 const MAX_BUF      = 200;
 
 /* -------------------- Queue tuning -------------------- */
-// We keep the queue healthy to avoid quota failures
-const QUEUE_MAX_ITEMS = 120;  // target to stay under
+const QUEUE_MAX_ITEMS   = 120;
 const QUEUE_FLUSH_BATCH = 4;
-const BACKLOG_SOFT = 60;      // if backlog < SOFT, prefer queue (offline-first UX)
-const BACKLOG_HARD = 200;     // if backlog >= HARD, evict oldest aggressively
-let offlineQueueCount = 0;
+const BACKLOG_SOFT      = 60;   // prefer queue while backlog is small (to keep chronology)
+const BACKLOG_HARD      = 200;  // aggressive eviction threshold
+let   offlineQueueCount = 0;
+
+// Strong “flush first” switch (stays true while we drain)
+let flushFirst = false;
 
 /* -------------------- DOM refs -------------------- */
 const qs = s => document.querySelector(s);
@@ -347,7 +349,7 @@ async function refreshQueueCount(){
   renderConn();
 }
 
-// Evict oldest when huge; if still failing and online -> post directly
+// Evict oldest when huge; if write still fails and we’re online -> post directly
 async function enqueueChunk(blob, seq, t){
   const addRecord = async () => queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
 
@@ -397,8 +399,11 @@ async function enqueueChunk(blob, seq, t){
 // returns true if it flushed any items
 async function flushQueueOnce(){
   if (!navigator.onLine) return false;
-  const items = await queueTake(QUEUE_FLUSH_BATCH).catch(()=>[]);
+
+  // get a few; make sure oldest go first (by seq if present)
+  let items = await queueTake(QUEUE_FLUSH_BATCH).catch(()=>[]);
   if (!items.length) return false;
+  items.sort((a,b) => (a.seq ?? 0) - (b.seq ?? 0));
 
   for (const it of items){
     const fd = new FormData();
@@ -412,7 +417,7 @@ async function flushQueueOnce(){
         const when = typeof it.t === 'number' ? it.t : ((await getMediaTime()) ?? elapsed);
         queueRender(raw, when);
       } else {
-        dbg('…all overlap (deduped)');
+        dbg('…flushed item overlapped (deduped)');
       }
       await queueRemove([it.id]).catch(()=>{});
     } catch {
@@ -427,22 +432,22 @@ async function flushQueueOnce(){
 let flushTimer = null;
 function startFlushLoop(){
   if (flushTimer) return;
-  // kick an immediate attempt so queued text appears ASAP
-  (async ()=>{ try{ await flushQueueOnce(); } catch{} })();
+  (async ()=>{ try{ await flushQueueOnce(); } catch{} })(); // immediate kick
   flushTimer = setInterval(async () => { try{ await flushQueueOnce(); } catch{} }, 2000);
 }
 function stopFlushLoop(){ if (flushTimer) { clearInterval(flushTimer); flushTimer = null; } }
 
-// Drain everything before switching back to WS/live
+// Drain everything before allowing live posts again
 async function drainQueueFully(){
-  if (!navigator.onLine) return;
+  flushFirst = true;
   stopFlushLoop();
-  let guard = 0; // prevents infinite loops if queueTake misbehaves
-  while (navigator.onLine && (await queueCount().catch(()=>0)) > 0 && guard++ < 200){
+  let guard = 0; // avoids infinite loops
+  while (navigator.onLine && (await queueCount().catch(()=>0)) > 0 && guard++ < 400){
     const had = await flushQueueOnce();
     if (!had) break;
   }
   startFlushLoop();
+  flushFirst = false;
 }
 
 window.addEventListener('online', () => {
@@ -524,7 +529,6 @@ function startWsProbe(){
   wsProbeInterval = setInterval(async ()=>{
     if (!settings.preferWS){ clearWsProbe(); return; }
     if (wsMode || !stream) return;
-    // If backlog exists, drain it first to show queued text before we switch back
     try{ if (await queueCount() > 0) return; }catch{}
     try{
       await wsConnect();
@@ -597,9 +601,11 @@ function startRecorder(){
     const blob = R.chunks.length ? new Blob(R.chunks, { type:R.chunks[0]?.type || 'audio/webm' }) : null;
     R.chunks = [];
     if (blob){
-      // Decide: queue vs direct post
+      // Force-queue while flushFirst OR any backlog exists, or offline.
       const backlog = offlineQueueCount;
-      const preferQueue = !navigator.onLine || (backlog > 0 && backlog < BACKLOG_SOFT);
+      const mustQueue = flushFirst || !navigator.onLine || backlog > 0;
+      const preferQueue = mustQueue || (backlog > 0 && backlog < BACKLOG_SOFT);
+
       if (preferQueue){
         dbg('📥 enqueue (offline or backlog present)');
         await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
@@ -726,8 +732,7 @@ btnStart.addEventListener('click', async () => {
     // *** Start = clean slate ***
     clearWsProbe();
     if (wsMode) wsStop();
-    recording = false;
-    abortAll();
+    recording = false; abortAll();
     try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch{}
     stream=null;
     stopTimer();
