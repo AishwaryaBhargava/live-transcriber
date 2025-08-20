@@ -52,6 +52,10 @@ const QUEUE_MAX_ITEMS = 120;
 const QUEUE_FLUSH_BATCH = 4;
 let offlineQueueCount = 0;
 
+// backlog caps (to prevent quota explosions)
+const BACKLOG_SOFT = 60;       // if backlog < SOFT → prefer queue (offline-first UX)
+const BACKLOG_HARD = 200;      // absolute cap: start evicting oldest aggressively
+
 // Chronological render buffer
 const REORDER_SECS = 8;
 const MAX_WAIT_MS = 7000;
@@ -373,19 +377,62 @@ async function refreshQueueCount(){
   renderConn();
 }
 
-async function enqueueChunk(blob, seq, t){
-  try{
-    const cnt = await queueCount().catch(()=>0);
-    if (cnt >= QUEUE_MAX_ITEMS){
-      const olds = await queueTake(Math.min(10,cnt));
-      await queueRemove(olds.map(o=>o.id)).catch(()=>{});
+async function enqueueChunk(blob, seq, t) {
+  const addRecord = async () =>
+    queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
+
+  try {
+    // Hard-cap: if backlog is huge, evict a chunk of the oldest first
+    let cnt = await queueCount().catch(() => 0);
+    while (cnt >= BACKLOG_HARD) {
+      const olds = await queueTake(Math.min(25, cnt)).catch(() => []);
+      if (!olds.length) break;
+      await queueRemove(olds.map(o => o.id)).catch(() => {});
+      cnt -= olds.length;
     }
-    await queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
-    await refreshQueueCount();
-    toast(`Offline: queued ${offlineQueueCount}`,'warn');
-    startFlushLoop();
-  } catch { toast('Failed to queue chunk','err'); }
+
+    // Normal soft cleanup if we’re above our preferred size
+    if (cnt >= QUEUE_MAX_ITEMS) {
+      const olds = await queueTake(Math.min(10, cnt)).catch(() => []);
+      if (olds.length) await queueRemove(olds.map(o => o.id)).catch(() => {});
+    }
+
+    // First attempt to add
+    await addRecord();
+  } catch (err) {
+    // Try one eviction + retry
+    try {
+      const olds = await queueTake(20).catch(() => []);
+      if (olds.length) await queueRemove(olds.map(o => o.id)).catch(() => {});
+      await addRecord();
+    } catch (err2) {
+      // If we’re online and queuing still fails, post this chunk directly
+      if (navigator.onLine) {
+        try {
+          const fd = new FormData();
+          fd.append('audio', blob, `seg-${seq}-direct.webm`);
+          fd.append('seq', String(seq));
+          const data = await postWithRetry(fd);
+          const raw = (data?.text || '').trim();
+          if (raw) {
+            const when = typeof t === 'number' ? t : ((await getMediaTime()) ?? elapsed);
+            queueRender(raw, when);
+          }
+          await refreshQueueCount();
+          return; // handled
+        } catch {
+          // fall through to toast
+        }
+      }
+      toast('Failed to queue chunk', 'err');
+      return;
+    }
+  }
+
+  await refreshQueueCount();
+  startFlushLoop();
 }
+
 
 async function fetchWithTimeout(url, options={}, timeoutMs=UPLOAD_TIMEOUT_MS){
   const ctrl = new AbortController();
@@ -616,26 +663,31 @@ function startRecorder(){
     R.chunks = [];
 
     if (blob){
-      if (!navigator.onLine || flushMode || offlineQueueCount > 0){
-        dbg(`📥 enqueue (offline or backlog present)`);
-        await enqueueChunk(blob, R.idx, (typeof R.t === 'number' ? R.t : null));
-        if (navigator.onLine) startFlushLoop();
+      const backlog = offlineQueueCount;
+      const preferQueue = !navigator.onLine || flushMode || (backlog > 0 && backlog < BACKLOG_SOFT);
+      if (preferQueue) {
+        await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
       } else {
+        // Try to post now; if it fails, fall back to queue
         const fd = new FormData();
         fd.append('audio', blob, `seg-${R.idx}-${Date.now()}.webm`);
         fd.append('seq', String(R.idx));
-        try{
+        try {
           dbg(`⬆️ posting seg #${R.idx}`);
           const data = await postWithRetry(fd);
           const raw = (data?.text || '').trim();
-          if (raw){
-            const when = (typeof R.t === 'number') ? R.t : ((await getMediaTime()) ?? elapsed);
+          if (raw) {
+            const when = typeof R.t === 'number' ? R.t : ((await getMediaTime()) ?? elapsed);
             queueRender(raw, when);
-          } else { dbg('…all overlap (deduped)'); }
-          if (offlineQueueCount > 0 && navigator.onLine){ await flushQueueOnce().catch(()=>{}); }
+          } else {
+            dbg('…all overlap (deduped)');
+          }
+          if (offlineQueueCount > 0 && navigator.onLine) {
+            await flushQueueOnce().catch(() => {});
+          }
         } catch {
-          dbg('❌ upload failed; queued');
-          await enqueueChunk(blob, R.idx, (typeof R.t === 'number' ? R.t : null));
+          dbg('❌ inline post failed; queued');
+          await enqueueChunk(blob, R.idx, typeof R.t === 'number' ? R.t : null);
           startFlushLoop();
         }
       }
