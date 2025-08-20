@@ -1,10 +1,11 @@
-// ===== Live Transcriber sidepanel (Source: Tab / Pick a Tab / Microphone)
+// ===== Live Transcriber sidepanel (Tab / Pick a Tab / Microphone)
 // WS-first with chunked fallback, auto-switch both ways, retry/backoff,
 // overlapped segments, dedup, exports, settings,
 // offline buffering with timeout + time-anchored segments + offline-first queue
-// chronological render buffer (orders offline + online lines)
-// fresh start on reload (autosave off by default)
-// persistent storage + resilient queue (quota-evict+retry) =====
+// + chronological render buffer (orders offline + online lines)
+// + fresh start on reload (autosave off by default)
+// + queue hard-reset on Start
+// + faster flusher + Wi-Fi toggle poller =====
 
 import { dbInit, queueAdd, queueTake, queueRemove, queueCount } from '../lib/db.js';
 
@@ -17,12 +18,12 @@ const AUTO_RESTORE = false;
 
 const defaultSettings = {
   provider: 'Deepgram',
-  preferWS: false,   // try WS first; fallback to chunked if not ready in time
-  segSec: 10,        // chunk length
-  overlapMs: 1200,   // chunk overlap
-  tsCadenceSec: 8,   // timestamp badge every N seconds
+  preferWS: false,         // try WS first; fallback to chunked if not ready in time
+  segSec: 10,              // chunk length (shorten to 6s for faster tests)
+  overlapMs: 1200,         // chunk overlap
+  tsCadenceSec: 8,         // timestamp badge every N seconds
   debug: false,
-  source: 'tab',     // 'tab' | 'pick' | 'mic'
+  source: 'tab',           // 'tab' | 'pick' | 'mic'
 };
 const settings = Object.assign({}, defaultSettings, loadSettings());
 function loadSettings(){
@@ -56,11 +57,11 @@ if (settings.source === 'mic')   setSourceMic.checked = true;
 
 for (const [el, key, coerce] of [
   [setProvider, 'provider', String],
-  [setWS, 'preferWS', v=>!!v],
-  [setSeg, 'segSec', v=>Math.max(5, Math.min(60, Number(v)||10))],
-  [setOvl, 'overlapMs', v=>Math.max(0, Math.min(3000, Number(v)||1200))],
-  [setTs, 'tsCadenceSec', v=>Math.max(3, Math.min(20, Number(v)||8))],
-  [chkDebug, 'debug', v=>!!v],
+  [setWS,       'preferWS', v=>!!v],
+  [setSeg,      'segSec',   v=>Math.max(5, Math.min(60, Number(v)||10))],
+  [setOvl,      'overlapMs',v=>Math.max(0, Math.min(3000, Number(v)||1200))],
+  [setTs,       'tsCadenceSec', v=>Math.max(3, Math.min(20, Number(v)||8))],
+  [chkDebug,    'debug',    v=>!!v],
 ]) {
   el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', ()=>{
     settings[key] = coerce(el.type === 'checkbox' ? el.checked : el.value);
@@ -82,15 +83,16 @@ for (const [el, key, coerce] of [
 
 // ----- Config -----
 const BACKEND_URL = 'https://live-transcriber-0md8.onrender.com';
+
 function wsUrl(){
   const u = new URL(BACKEND_URL);
   u.protocol = (u.protocol === 'https:') ? 'wss:' : 'ws:';
   u.pathname = '/realtime';
-  u.search = '?enc=webm';
+  u.search   = '?enc=webm';
   return u.toString();
 }
 
-// Render free dyno is slow to abort; use longer timeout for hosted, shorter for local
+// Render can be slow to cold-start → longer timeout; otherwise faster
 const UPLOAD_TIMEOUT_MS = BACKEND_URL.includes('onrender.com') ? 15000 : 3000;
 
 // dedup tuning
@@ -98,14 +100,15 @@ const DEDUP_MAX_TAIL_WORDS = 30;
 const DEDUP_MIN_MATCH_WORDS = 3;
 
 // offline queue tuning
-const QUEUE_MAX_ITEMS = 120;
-const QUEUE_FLUSH_BATCH = 4;
-let offlineQueueCount = 0;
+const QUEUE_MAX_ITEMS     = 120;
+const QUEUE_FLUSH_BATCH   = 12;     // faster drain
+const FLUSH_INTERVAL_MS   = 1000;   // tick faster
+let offlineQueueCount     = 0;
 
 // chronological render buffer tuning
-const REORDER_SECS = 8;  // hold live lines to allow earlier offline lines to catch up
-const MAX_WAIT_MS = 7000;
-const MAX_BUF = 200;
+const REORDER_SECS = 8;   // hold live lines to allow earlier offline lines to catch up
+const MAX_WAIT_MS  = 7000;
+const MAX_BUF      = 200;
 
 // ----- DOM refs -----
 const elStatus = qs('#status');
@@ -160,26 +163,24 @@ function currentSourceLabel(){
 }
 
 // ----- Transcript store (+ ordered insertion) -----
-const entries = []; // always sorted by t ascending: {t,text}
+const entries = []; // sorted by t asc: {t, text}
 let lastStamp = -Infinity;
 
 // create + insert a line DOM at the correct chronological spot
 function insertTranscriptLine(text, atSeconds){
   if(!text || !text.trim()) return;
-  const t = (typeof atSeconds === 'number') ? atSeconds : elapsed;
+  const t = typeof atSeconds === 'number' ? atSeconds : elapsed;
 
   // timestamp badge rules
   let stampThis = false;
   if (t < lastStamp) {
-    stampThis = true;           // backfill → force badge (don't advance lastStamp)
+    stampThis = true;                           // backfill
   } else if (!isFinite(lastStamp) || t - lastStamp >= settings.tsCadenceSec) {
-    stampThis = true;
-    lastStamp = t;
+    stampThis = true; lastStamp = t;
   }
 
   const div = document.createElement('div');
-  div.className='line';
-  div.dataset.t = String(t);
+  div.className='line'; div.dataset.t = String(t);
   if (settings.debug) div.style.display='';
 
   if (stampThis) {
@@ -190,17 +191,15 @@ function insertTranscriptLine(text, atSeconds){
   }
   div.appendChild(document.createTextNode(text));
 
-  // insert DOM in chronological order among .line nodes
   const lines = Array.from(elTranscript.querySelectorAll('.line'));
-  let inserted = false;
+  let inserted=false;
   for (let i=0;i<lines.length;i++){
     const lt = Number(lines[i].dataset.t || 0);
-    if (t < lt){ elTranscript.insertBefore(div, lines[i]); inserted = true; break; }
+    if (t < lt){ elTranscript.insertBefore(div, lines[i]); inserted=true; break; }
   }
   if (!inserted) elTranscript.appendChild(div);
   elTranscript.scrollTop = elTranscript.scrollHeight;
 
-  // insert into entries (kept sorted)
   let idx = entries.findIndex(e => t < e.t);
   if (idx === -1) idx = entries.length;
   entries.splice(idx, 0, { t, text });
@@ -219,8 +218,7 @@ function insertTranscriptLine(text, atSeconds){
 function dbg(msg){
   if (!settings.debug) return;
   const d=document.createElement('div'); d.className='partial'; d.textContent=msg;
-  d.style.display = '';
-  elTranscript.appendChild(d); elTranscript.scrollTop=elTranscript.scrollHeight;
+  d.style.display = ''; elTranscript.appendChild(d); elTranscript.scrollTop=elTranscript.scrollHeight;
 }
 
 // click timestamp badge to seek
@@ -263,7 +261,7 @@ async function startPickerCapture(){
 }
 async function startMicCapture(){
   const s = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true },
     video: false
   });
   const at = s.getAudioTracks();
@@ -339,49 +337,59 @@ function download(name, text, mime='text/plain'){
 // ====== Offline queue helpers ======
 await dbInit().catch(()=>{/* ignore */});
 
-// Ask browser to persist storage so IDB isn't wiped under pressure
-try{
-  if (navigator.storage && navigator.storage.persist) {
-    const persisted = await navigator.storage.persisted();
-    if (!persisted) { await navigator.storage.persist().catch(()=>{}); }
-  }
-}catch{}
-
 async function refreshQueueCount(){
   try { offlineQueueCount = await queueCount(); }
   catch { offlineQueueCount = 0; }
   renderConn();
 }
 
-// Resilient enqueue with quota-evict+retry
-async function enqueueChunk(blob, seq, t){
-  let attempts = 0;
-  while (attempts < 3) {
-    try {
-      const cnt = await queueCount().catch(()=>0);
-      if (cnt >= QUEUE_MAX_ITEMS) {
-        const olds = await queueTake(Math.min(10, cnt)).catch(()=>[]);
-        if (olds.length) await queueRemove(olds.map(o=>o.id)).catch(()=>{});
-      }
-      await queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
-      await refreshQueueCount();
-      toast(`Offline: queued ${offlineQueueCount}`, 'warn');
-      startFlushLoop();
-      return;
-    } catch (e) {
-      console.error('enqueueChunk failed', e);
-      const msg = String(e?.message || e?.name || '');
-      const quota = /quota|QuotaExceeded|NotEnough|space/i.test(msg);
-      if (!quota) break;
-      const olds = await queueTake(5).catch(()=>[]);
-      if (!olds.length) break;
-      await queueRemove(olds.map(o=>o.id)).catch(()=>{});
-      attempts++;
+// hard wipe the backlog (IndexedDB)
+let flushTimer = null;
+async function clearQueuedBacklog(){
+  try {
+    if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+    let remaining = await queueCount().catch(()=>0);
+    while (remaining > 0){
+      const batch = await queueTake(Math.min(50, remaining)).catch(()=>[]);
+      if (!batch.length) break;
+      await queueRemove(batch.map(b => b.id)).catch(()=>{});
+      remaining -= batch.length;
     }
-  }
-  toast('Failed to queue chunk (storage full?)', 'err');
+  } catch {}
+  offlineQueueCount = 0;
+  renderConn();
 }
 
+async function enqueueChunk(blob, seq, t){
+  try {
+    const cnt = await queueCount().catch(()=>0);
+    if (cnt >= QUEUE_MAX_ITEMS) {
+      const olds = await queueTake(Math.min(10, cnt));
+      await queueRemove(olds.map(o=>o.id)).catch(()=>{});
+    }
+    await queueAdd({ blob, mime: blob.type || 'audio/webm', seq, t });
+    await refreshQueueCount();
+    toast(`Offline: queued ${offlineQueueCount}`, 'warn');
+    startFlushLoop();
+  } catch {
+    toast('Failed to queue chunk', 'err');
+  }
+}
+
+async function postWithRetry(formData, tries = 2, delay = 300){
+  for (let i=0;i<tries;i++){
+    try{
+      const resp = await fetchWithTimeout(`${BACKEND_URL}/transcribe`, { method:'POST', body: formData }, UPLOAD_TIMEOUT_MS);
+      if (resp.ok) return await resp.json();
+      if (resp.status < 500) throw new Error(`HTTP ${resp.status}`);
+    }catch(e){
+      if (i === tries-1) throw e;
+      await new Promise(r => setTimeout(r, delay * Math.pow(3,i))); // 300, 900
+    }
+  }
+}
+
+// flush one batch
 async function flushQueueOnce(){
   if (!navigator.onLine) return false;
   const items = await queueTake(QUEUE_FLUSH_BATCH).catch(()=>[]);
@@ -396,10 +404,12 @@ async function flushQueueOnce(){
       const raw = (data?.text || '').trim();
       if (raw) {
         const when = (typeof it.t === 'number') ? it.t : ((await getMediaTime()) ?? elapsed);
-        queueRender(raw, when); // render buffer (ensures chronological)
+        queueRender(raw, when);
       }
       await queueRemove([it.id]);
     } catch {
+      // put it back so we try again later
+      await queueAdd({ blob: it.blob, mime: it.blob.type || 'audio/webm', seq: it.seq, t: it.t }).catch(()=>{});
       break;
     }
   }
@@ -407,24 +417,23 @@ async function flushQueueOnce(){
   return true;
 }
 
-let flushTimer = null;
 function startFlushLoop(){
   if (flushTimer) return;
-  // kick an immediate flush, then poll quickly while recovering
-  (async()=>{ try{ await flushQueueOnce(); }catch{} })();
+  (async ()=>{ try { await flushQueueOnce(); } catch {} })();
   flushTimer = setInterval(async ()=>{
     try { await flushQueueOnce(); } catch {}
-    if (!(await queueCount().catch(()=>0))) { clearInterval(flushTimer); flushTimer=null; }
-  }, 2000);
+    const left = await queueCount().catch(()=>0);
+    if (!left){ clearInterval(flushTimer); flushTimer = null; }
+  }, FLUSH_INTERVAL_MS);
 }
 
-// ---- Flush-first mode: drain queued chunks completely, then resume normal posting
+// Full drain (used when coming back online)
 let flushMode = false;
 async function drainQueueFully(){
   if (!navigator.onLine) return;
   flushMode = true;
-  try{
-    while ((await queueCount().catch(()=>0)) > 0 && navigator.onLine) {
+  try {
+    while (await queueCount() > 0 && navigator.onLine) {
       const had = await flushQueueOnce();
       if (!had) break;
     }
@@ -437,12 +446,26 @@ async function drainQueueFully(){
 window.addEventListener('online', ()=>{
   renderConn();
   if (offlineQueueCount > 0) toast('Back online — flushing queued chunks', 'ok');
-  drainQueueFully().then(()=> startFlushLoop()).catch(()=> startFlushLoop());
+  drainQueueFully().then(()=>startFlushLoop()).catch(()=>startFlushLoop());
 });
 window.addEventListener('offline', ()=>{
   renderConn();
   toast('You are offline. Chunks will be queued', 'warn');
 });
+
+// Additional poller to catch real Wi-Fi switch transitions
+let wasOnline = navigator.onLine;
+setInterval(async ()=>{
+  const now = navigator.onLine;
+  if (!wasOnline && now){
+    renderConn();
+    await drainQueueFully().catch(()=>{});
+    startFlushLoop();
+  } else if (wasOnline && !now){
+    renderConn();
+  }
+  wasOnline = now;
+}, 1500);
 
 // ===== fetch with timeout =====
 async function fetchWithTimeout(url, options = {}, timeoutMs = UPLOAD_TIMEOUT_MS) {
@@ -459,7 +482,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = UPLOAD_TIMEOUT_MS
 let ws = null, wsMode = false, wsOpen = false;
 let wsRecorder = null;
 let wsProbeInterval = null;
-
 function clearWsProbe(){ if (wsProbeInterval) { clearInterval(wsProbeInterval); wsProbeInterval = null; } }
 
 function wsConnect() {
@@ -480,7 +502,7 @@ function wsConnect() {
           const isFinal = msg?.is_final === true || msg?.type === 'UtteranceEnd';
           if (text && isFinal) {
             const secP = getMediaTime().catch(()=>null);
-            Promise.resolve(secP).then(s => { queueRender(text, s ?? elapsed); });
+            Promise.resolve(secP).then(s => queueRender(text, s ?? elapsed));
           }
         } catch {}
       };
@@ -490,9 +512,9 @@ function wsConnect() {
 
 function wsStartSending(stream){
   try {
-    wsRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 96000 });
+    wsRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 160000 });
   } catch {
-    wsRecorder = new MediaRecorder(stream, { audioBitsPerSecond: 96000 });
+    wsRecorder = new MediaRecorder(stream, {});
   }
   wsRecorder.ondataavailable = (e)=>{
     if (e.data && e.data.size > 0 && ws && wsOpen) {
@@ -531,8 +553,10 @@ function startWsProbe(){
   wsProbeInterval = setInterval(async ()=>{
     if (!settings.preferWS) { clearWsProbe(); return; }
     if (wsMode || !stream) return;
-    // delay switching to WS if backlog still exists, so offline text lands first
+
+    // don't switch to WS while we still have backlog
     try { if (await queueCount() > 0) return; } catch {}
+
     try {
       await wsConnect();
       wsMode = true; setConn('Reconnected (WS)');
@@ -552,9 +576,9 @@ let segIndex = 0, allowOverlap = true;
 
 function makeRecOpts(){
   const list = [
-    { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond: 96000 },
-    { mimeType:'audio/webm',            audioBitsPerSecond: 96000 },
-    {                                  audioBitsPerSecond: 96000 }
+    { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond:160000 },
+    { mimeType:'audio/webm',            audioBitsPerSecond:160000 },
+    {                                  audioBitsPerSecond:160000 }
   ];
   return list.find(o=>{ try{ return o.mimeType? MediaRecorder.isTypeSupported(o.mimeType):true; }catch{return false;} }) || {};
 }
@@ -566,25 +590,11 @@ function stopRecorder(R){
 }
 function abortAll(){ for (const R of Array.from(ACTIVE)) stopRecorder(R); ACTIVE.clear(); }
 
-async function postWithRetry(formData, tries = 2, delay = 300){
-  for (let i=0;i<tries;i++){
-    try{
-      const resp = await fetchWithTimeout(`${BACKEND_URL}/transcribe`, { method:'POST', body: formData }, UPLOAD_TIMEOUT_MS);
-      if (resp.ok) return await resp.json();
-      if (resp.status < 500) throw new Error(`HTTP ${resp.status}`);
-    }catch(e){
-      if (i === tries-1) throw e;
-      await new Promise(r => setTimeout(r, delay * Math.pow(3,i))); // 300, 900
-    }
-  }
-}
-
 function startRecorder(){
   if(!recording || !stream) return;
 
   if(!allowOverlap){ for (const R of Array.from(ACTIVE)) stopRecorder(R); }
 
-  // Create a segment record + time anchor (when it STARTS)
   const R = { idx: ++segIndex, chunks: [], mr:null, stopT:null, spawnT:null, t:null };
   getMediaTime().then(s => { R.t = (typeof s === 'number') ? s : elapsed; }).catch(()=>{ R.t = elapsed; });
 
@@ -604,7 +614,7 @@ function startRecorder(){
     const blob = R.chunks.length ? new Blob(R.chunks, {type:(R.chunks[0]?.type || 'audio/webm')}) : null;
     R.chunks = [];
     if(blob){
-      // flush-first: while offline or while we still have backlog or during draining, enqueue
+      // flush-first: while offline OR while we still have backlog OR during draining → enqueue
       if (!navigator.onLine || flushMode || offlineQueueCount > 0) {
         dbg('📥 enqueue (offline or flushing/backlog present)');
         await enqueueChunk(blob, R.idx, (typeof R.t === 'number') ? R.t : null);
@@ -620,7 +630,7 @@ function startRecorder(){
           if(raw){
             const when = (typeof R.t === 'number') ? R.t : ((await getMediaTime()) ?? elapsed);
             queueRender(raw, when);
-          }else{ dbg('…all overlap (deduped)'); }
+          } else { dbg('…all overlap (deduped)'); }
         }catch{
           dbg('❌ upload failed; queued');
           await enqueueChunk(blob, R.idx, (typeof R.t === 'number') ? R.t : null);
@@ -649,13 +659,13 @@ function resetSessionKeepTranscript(){
 }
 
 // ---------- Render buffer (orders lines by time, then dedups at render) ----------
-let renderBuf = []; // [{t,text,at}]
+let renderBuf = []; // [{t, text, at}]
 let renderTimer = null;
 let maxTSeen = -Infinity;
 
 function queueRender(rawText, t){
   const text = (rawText || '').trim(); if (!text) return;
-  const when = (typeof t === 'number') ? t : elapsed;
+  const when = typeof t === 'number' ? t : elapsed;
   maxTSeen = Math.max(maxTSeen, when);
   renderBuf.push({ t: when, text, at: performance.now() });
   if (renderBuf.length > MAX_BUF) {
@@ -670,11 +680,19 @@ function ensureRenderTimer(){ if (!renderTimer) renderTimer = setInterval(flushR
 function stopRenderTimer(){ if (renderTimer){ clearInterval(renderTimer); renderTimer=null; } }
 function flushRenderable(){
   if (renderBuf.length === 0) { stopRenderTimer(); return; }
-  renderBuf.sort((a,b)=> (a.t===b.t? a.at-b.at : a.t-b.t));
-  const out=[]; const now=performance.now(); const horizon = maxTSeen - REORDER_SECS; const remain=[];
-  for (const item of renderBuf) { if (item.t <= horizon || now - item.at > MAX_WAIT_MS) out.push(item); else remain.push(item); }
+  renderBuf.sort((a,b)=> (a.t===b.t ? a.at-b.at : a.t-b.t));
+
+  const out=[]; const now = performance.now(); const horizon = maxTSeen - REORDER_SECS; const remain=[];
+  for (const item of renderBuf){
+    if (item.t <= horizon || now - item.at > MAX_WAIT_MS) out.push(item);
+    else remain.push(item);
+  }
   renderBuf = remain;
-  for (const it of out) { const merged = mergeAndDedup(it.text); if (merged) insertTranscriptLine(merged, it.t); }
+
+  for (const it of out) {
+    const merged = mergeAndDedup(it.text);
+    if (merged) insertTranscriptLine(merged, it.t);
+  }
   if (renderBuf.length === 0) stopRenderTimer();
 }
 
@@ -683,11 +701,8 @@ setConn('Disconnected');
 setStatus('Idle');
 setButtons({start:true,pause:false,resume:false,stop:false,exportable:entries.length>0,canClear:entries.length>0});
 
-if (AUTO_RESTORE) {
-  restore();
-} else {
-  try { localStorage.removeItem(LS_TXT); } catch {}
-}
+if (AUTO_RESTORE) { restore(); }
+else { try { localStorage.removeItem(LS_TXT); } catch {} }
 
 document.querySelectorAll('.partial').forEach(n => n.style.display = settings.debug ? '' : 'none');
 refreshQueueCount().then(()=>{ if (offlineQueueCount>0) startFlushLoop(); });
@@ -701,27 +716,18 @@ function clearTranscriptStateAndUI(){
   persist();
   setButtons({start:true,pause:false,resume:false,stop:!!stream,exportable:false,canClear:false});
 }
-async function clearQueuedBacklog(){
-  try{
-    if (flushTimer) { clearInterval(flushTimer); flushTimer=null; }
-    let remaining = await queueCount().catch(()=>0);
-    while (remaining > 0) {
-      const batch = await queueTake(Math.min(50, remaining)).catch(()=>[]);
-      if (!batch.length) break;
-      await queueRemove(batch.map(b=>b.id)).catch(()=>{});
-      remaining -= batch.length;
-    }
-  }catch{}
-  offlineQueueCount = 0; renderConn();
-}
+
+// One call we await at top of Start
 async function startFresh(){
   clearWsProbe?.();
   if (wsMode) wsStop();
   recording=false; abortAll();
-  try{ if(stream) stream.getTracks().forEach(t=>t.stop()); }catch{}
+  try { if (stream) stream.getTracks().forEach(t=>t.stop()); } catch {}
   stream=null; stopTimer();
+
   clearTranscriptStateAndUI();
-  await clearQueuedBacklog();
+  await clearQueuedBacklog();     // <<< queue becomes 0 on every Start
+  await refreshQueueCount();
   try { localStorage.removeItem(LS_TXT); } catch {}
 }
 
@@ -731,7 +737,8 @@ btnStart.addEventListener('click', async ()=>{
     setStatus('Starting…');
     setButtons({start:false,pause:false,resume:false,stop:false,exportable:entries.length>0,canClear:entries.length>0});
 
-    await startFresh();
+    await startFresh();           // hard reset transcript + backlog (queue==0)
+    resetSessionKeepTranscript();
 
     try {
       if (settings.source === 'tab') {
@@ -770,8 +777,6 @@ btnStart.addEventListener('click', async ()=>{
     setConn('Connected');
     setStatus(`Recording (fallback) — ${currentSourceLabel()}`);
     startRecorder();
-    if (offlineQueueCount > 0) startFlushLoop();
-
   }catch(err){
     setStatus(`Error: ${err.message}`);
     setButtons({start:true,pause:false,resume:false,stop:false,exportable:entries.length>0,canClear:entries.length>0});
