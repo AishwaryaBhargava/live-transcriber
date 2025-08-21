@@ -172,12 +172,6 @@ npm run start:server
 
 ---
 
-## 📝 License
-
-ISC
-
----
-
 ### Maintainer
 
 Open an issue: [https://github.com/AishwaryaBhargava/live-transcriber/issues](https://github.com/AishwaryaBhargava/live-transcriber/issues)
